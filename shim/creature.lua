@@ -371,16 +371,13 @@ end
 -- ---------------------------------------------------------------------------
 -- stubs that MUST answer, and must answer the C++ default
 -- ---------------------------------------------------------------------------
--- Party mana: verified (work item R1, protocolgameparse.cpp:2434-2456) that opcode 0x8B's
--- sub-types 11 ("mana percent"), 12 ("show status") and 13 ("vocation") all funnel into the
--- SAME setCreatureVocation() call in the real client -- Creature::setManaPercent has zero C++
--- call sites at all, so there never was a separate party-mana byte on this wire to store at
--- 1530 (gap G7 retitled accordingly -- see docs/shim/api-game.md).  vBot's own party-mana
--- feature comes from its self-hosted BotServer relay instead, a stated non-goal for this
--- client (docs/vbot/parity.md sec.3).  100 is the "full" reading every consumer treats as "no
--- reason to heal".
+-- Party mana (opcode 0x8B) is not stored -- gap G7.  100 is the "full" reading every
+-- consumer treats as "no reason to heal".
 function Creature:getManaPercent()
-    self._reg:report('Creature:getManaPercent', 'no genuine party-mana byte exists on this wire at 1530 (gap G7); vBot\'s own reading comes from its BotServer relay, not implemented here')
+    local r = rec(self)
+    local m = r and r.manaPercent
+    if type(m) == 'number' then return m end
+    self._reg:report('Creature:getManaPercent', 'opcode 0x8B party mana is not parsed (gap G7)')
     return 100
 end
 
@@ -638,17 +635,15 @@ function LocalPlayer:getVirtue()
     return 0
 end
 
--- G4 CLOSED (work item R1): proto/parser.lua's S[0x2A] now stores the supply-stash byte on
--- state.player.supplyStashAvailable, so this reads a real value after the first
--- SpecialContainer packet. The report+false fallback only fires before that packet has ever
--- arrived this session (a genuine "not known yet", not a discarded byte).
+-- G4: proto/parser.lua:909 reads the supply-stash byte and discards it.  Latched by
+-- shim/g_game.lua when the flag ever becomes available; false until then, and loud.
 function LocalPlayer:isSupplyStashAvailable()
     local p = pl(self)
     if type(p) == 'table' and p.supplyStashAvailable ~= nil then
         return p.supplyStashAvailable == true
     end
     self._reg:report('LocalPlayer:isSupplyStashAvailable',
-                     'state.player.supplyStashAvailable not populated yet (no SpecialContainer packet this session)')
+                     'proto/parser.lua:909 discards the byte (gap G4)')
     return false
 end
 

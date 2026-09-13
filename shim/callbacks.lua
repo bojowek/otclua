@@ -172,7 +172,10 @@ end
 --- Diagnostics: how many times each sandbox callback was dispatched, and which
 --- parser events arrived that this bridge deliberately drops.
 function Handle:stats()
-    return { fired = self.fired, dropped = self.dropped, wired = self.wired }
+    return {
+        fired = self.fired, dropped = self.dropped, wired = self.wired,
+        signalled = self.signalled, signalDropped = self.signalDropped,
+    }
 end
 
 --- install(LC, cb, deps) -> handle
@@ -200,6 +203,7 @@ function callbacks.install(LC, cb, deps)
     local H = setmetatable({
         _bus = bus, _handles = {}, deps = deps,
         fired = {}, dropped = {}, wired = {},
+        signalled = {}, signalDropped = {},
     }, Handle)
 
     -- Every dispatch is pcall'd.  executor.lua's dispatchers call user callbacks
@@ -485,9 +489,10 @@ function callbacks.install(LC, cb, deps)
         local slot = gg and rawget(gg, name)
         if slot == nil then
             H.dropped[name] = (H.dropped[name] or 0) + 1
+            H.signalDropped[name] = (H.signalDropped[name] or 0) + 1
             return
         end
-        H.fired[name] = (H.fired[name] or 0) + 1
+        H.signalled[name] = (H.signalled[name] or 0) + 1
         if signalcall then
             local ok, err = pcall(signalcall, slot, ...)
             if not ok and log and log.error then

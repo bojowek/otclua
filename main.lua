@@ -64,8 +64,11 @@ Runtime
   --log-file=PATH          append every log line to PATH as well
   --capture=PATH           append every inbound payload as a .cam '<' record
   --ping=MS                keepalive interval in ms             (default: 10000)
+    --relog-on-death         reconnect 1.5 s after the server reports death
   --exit-after=SECONDS     disconnect cleanly and exit 0 after N seconds in game
                            (live testing: bounds a run without killing the socket)
+    --daily-reward           open and claim the active free daily reward
+    --daily-reward-item=ID   select this item when the active reward has choices
 
 Bot layer (vBot 4.8 behaviour: HealBot, AttackBot, CaveBot, TargetBot)
   --bot                    enable the bot layer once the game has started
@@ -85,12 +88,15 @@ vBot compatibility shim (docs/shim/COMPAT.md) -- runs the REAL vBot 4.8 scripts
   --vbot                   run the user's real vBot tree through the otclient
                            compatibility shim instead of the native bot layer.
                            Mutually exclusive with --bot / --cavebot / --targetbot.
-  --vbot-profile=DIR       the /bot/<config> directory to run, e.g.
-                           .../otclient/profiles/bot/vBot_4.8.  Implies --vbot.
-                           The otclient checkout, the g_resources write dir and the
-                           config name are all derived from it.
+    --vbot-profile=DIR       an existing profiles/bot/<config> or
+                                                     mods/game_bot/default_configs/vBot_4.8 directory.
+                                                     Implies --vbot.  Stock configurations are always read-only.
   --vbot-otroot=DIR        override the otclient checkout (READ-ONLY) the shim reads
                            mods/game_bot and modules/ from
+    --vbot-userdir=DIR       keep a stock configuration read-only but persist storage,
+                                                     vBot_configs, cavebot_configs and targetbot_configs under
+                                                     DIR.  Requires --vbot-write to actually save.
+                                                     Environment: LUACLIENT_VBOT_USERDIR.
   --vbot-vprofile=N        storage/profile_<N>.json    (default: --bot-vprofile, else 1)
   --vbot-tick=MS           the executor tick in ms                    (default 10)
   --vbot-strict            a missing API raises instead of returning an inert stub
@@ -203,16 +209,20 @@ local function parseArgs(argv)
         or name == 'content-revision' or name == 'replay' or name == 'login-url'
         or name == 'bot-profile' or name == 'bot-vprofile' or name == 'cavebot'
         or name == 'targetbot' or name == 'bot-status-interval' or name == 'minimap'
-        or name == 'session-key'
+        or name == 'session-key' or name == 'daily-reward-item'
         or name == 'proxy' or name == 'control-port' or name == 'control-bind'
         or name == 'control-token-file' or name == 'control-token-fd'
-        or name == 'vbot-profile' or name == 'vbot-otroot'
+        or name == 'vbot-profile' or name == 'vbot-otroot' or name == 'vbot-userdir'
         or name == 'vbot-vprofile' or name == 'vbot-tick'
         or name == 'instance-name' then
             v, err = valueOf(name, inline)
             if not v then return nil, err end
         elseif name == 'proxy-auth' then
             v = inline                    -- OPTIONAL: bare means "read stdin"
+        elseif name == 'relog-on-death' then
+            cfg.relogOnDeath = true
+        elseif name == 'daily-reward' then
+            cfg.dailyReward = true
         elseif inline ~= nil and inline ~= '' then
             return nil, ('--%s takes no value'):format(name)
         end
@@ -235,6 +245,13 @@ local function parseArgs(argv)
         elseif name == 'session-key' then cfg.sessionKey = v
         elseif name == 'ping'      then cfg.pingMs = tonumber(v) or 10000
         elseif name == 'exit-after' then cfg.exitAfter = tonumber(v)
+        elseif name == 'daily-reward' then cfg.dailyReward = true
+        elseif name == 'daily-reward-item' then
+            cfg.dailyRewardItem = tonumber(v)
+            if not cfg.dailyRewardItem or cfg.dailyRewardItem < 1 then
+                return nil, '--daily-reward-item must be a positive item id'
+            end
+            cfg.dailyReward = true
         elseif name == 'replay'    then cfg.replay = v
         elseif name == 'dry-run'   then cfg.dryRun = true
         elseif name == 'bot'       then cfg.bot = true
@@ -268,6 +285,14 @@ local function parseArgs(argv)
             cfg.vbotProfile = v
             cfg.vbot = true
         elseif name == 'vbot-otroot' then cfg.vbotOtRoot = v; cfg.vbot = true
+        elseif name == 'vbot-userdir' then
+            for part in tostring(v):gmatch('[^/\\]+') do
+                if part == '..' then
+                    return nil, '--vbot-userdir must not contain a ".." path component'
+                end
+            end
+            cfg.vbotUserDir = v
+            cfg.vbot = true
         elseif name == 'vbot-vprofile' then cfg.vbotVProfile = tonumber(v)
         elseif name == 'vbot-tick' then cfg.vbotTickMs = tonumber(v)
         elseif name == 'vbot-strict' then cfg.vbotStrict = true
@@ -315,6 +340,7 @@ local function parseArgs(argv)
             cfg.secretReaders[#cfg.secretReaders + 1] =
                 { field = 'controlToken', read = function() return readFd(n) end }
         elseif name == 'instance-name' then cfg.instanceName = v
+        elseif name == 'relog-on-death' then cfg.relogOnDeath = true
         elseif name == 'selftest'  then cfg.selftest = true
         elseif name == 'help'      then cfg.help = true
         else return nil, ('unknown flag --%s (try --help)'):format(name)
@@ -392,6 +418,7 @@ local transport = require('proto.transport')
 local handshake = require('proto.handshake')
 local parser   = require('proto.parser')
 local sender   = require('proto.sender')
+local dailyReward = require('game.daily_reward')
 
 local LC = {
     log       = log,
@@ -457,7 +484,7 @@ local function statusLine(force)
     }, '|')
     if not force and key == lastStatus.key then return end
     lastStatus.key = key
-    log.info('player: hp %d/%d  mana %d/%d  level %d  pos %s',
+    log.debug('player: hp %d/%d  mana %d/%d  level %d  pos %s',
         pl.health or 0, pl.maxHealth or 0, pl.mana or 0, pl.maxMana or 0, pl.level or 0,
         pos and ('(%d,%d,%d)'):format(pos.x, pos.y, pos.z) or '(unknown)')
 end
@@ -476,9 +503,11 @@ local function defaultBotProfile()
         SCRIPT_DIR .. '/../../otclient_mehah1530/otclient/profiles/bot/vBot_4.8',
         'D:/Claude/otclient_mehah1530/otclient/profiles/bot/vBot_4.8',
         '/mnt/d/Claude/otclient_mehah1530/otclient/profiles/bot/vBot_4.8',
+        SCRIPT_DIR .. '/otclient_release/profiles/bot/vBot_4.8',
+        SCRIPT_DIR .. '/otclient_release/mods/game_bot/default_configs/vBot_4.8',
     }
     for _, c in ipairs(candidates) do
-        local f = io.open(c .. '/vBot_configs/profile_1/HealBot.json', 'r')
+        local f = io.open(c .. '/_Loader.lua', 'r')
         if f then f:close(); return (c:gsub('\\', '/')) end
     end
     return SCRIPT_DIR .. '/profiles'
@@ -590,6 +619,8 @@ local function startBot(cfg)
     local okb, b = pcall(botmod.new, LC, {
         profileDir = dir,
         vprofile   = cfg.botVProfile or 1,
+        characterId = LC.state and LC.state.player and LC.state.player.id,
+        characterName = cfg.characterName,
         known      = LC.minimap,
         cavebot    = cfg.cavebot,
         targetbot  = cfg.targetbot,
@@ -614,6 +645,7 @@ local function startBot(cfg)
         enableCavebot   = cfg.cavebot   and true or nil,
         enableTargetbot = cfg.targetbot and true or nil,
     }
+    b:loadProfileScripts()
     b:start()
 
     local every = cfg.botStatusMs or 5000
@@ -627,29 +659,13 @@ end
 -- API surface synthesised in shim/ (docs/shim/COMPAT.md).  It replaces the native
 -- bot layer entirely -- never both (invariant I10, enforced in resolveSecrets).
 --
--- `--vbot-profile=DIR` names the /bot/<config> directory.  Everything else falls
--- out of it: config = the last path component, the g_resources write dir = its
--- grandparent (.../profiles), and the otclient checkout = one above that.  That
--- is exactly the layout the reference client itself uses, so pointing at the real
--- profile is all the user has to do.
 local function resolveVBotPaths(cfg)
-    local dir = cfg.vbotProfile or defaultBotProfile()
-    dir = tostring(dir):gsub('\\', '/'):gsub('/+$', '')
-    local parent, config = dir:match('^(.*)/([^/]+)$')
-    if not config then return nil, ('--vbot-profile: %s is not a directory path'):format(dir) end
-    -- <writeDir>/bot/<config>: the shim's g_resources is rooted at the profiles dir.
-    local writeDir = parent:match('^(.*)/[Bb]ot$')
-    if not writeDir then
-        return nil, ('--vbot-profile: %s must live under a "bot" directory '
-                     .. '(the layout is <profiles>/bot/<config>)'):format(dir)
-    end
-    local otRoot = cfg.vbotOtRoot
-    if not otRoot then otRoot = writeDir:match('^(.*)/[^/]+$') end
-    if not otRoot then
-        return nil, 'cannot derive the otclient root; pass --vbot-otroot=DIR'
-    end
-    return { dir = dir, config = config, writeDir = writeDir,
-             otRoot = (tostring(otRoot):gsub('\\', '/'):gsub('/+$', '')) }
+    return require('shim.profile').resolve({
+        profileDir = cfg.vbotProfile,
+        otRoot = cfg.vbotOtRoot,
+        userDir = cfg.vbotUserDir,
+        defaultProfile = defaultBotProfile(),
+    })
 end
 
 local function startVBot(cfg)
@@ -668,7 +684,12 @@ local function startVBot(cfg)
         cfg._minimapTried = true
         LC.minimap = loadMinimap(cfg)
     end
-    local readOnly = (not cfg.vbotWrite) or (cfg.dryRun and true or false)
+    if paths.stock and cfg.vbotWrite and not paths.overlays then
+        log.warn('vbot: stock configuration is read-only; --vbot-write cannot modify it '
+                 .. '(use --vbot-userdir=DIR to keep your own storage and configs)')
+    end
+    local readOnly = paths.stock or (not cfg.vbotWrite) or (cfg.dryRun and true or false)
+    local overlays = (cfg.vbotWrite and not cfg.dryRun) and paths.overlays or nil
     log.info('vbot: %s (config %s, vprofile %d) from %s -- %s, tick %d ms%s',
              paths.dir, paths.config, cfg.vbotVProfile or cfg.botVProfile or 1,
              paths.otRoot, readOnly and 'READ-ONLY' or 'writes allowed (--vbot-write)',
@@ -677,6 +698,8 @@ local function startVBot(cfg)
     local okb, S, serr = pcall(shim.start, LC, {
         otRoot   = paths.otRoot,
         writeDir = paths.writeDir,
+        mounts   = paths.mounts,
+        overlays = overlays,
         config   = paths.config,
         profile  = cfg.vbotVProfile or cfg.botVProfile or 1,
         tickMs   = cfg.vbotTickMs or 10,
@@ -685,6 +708,9 @@ local function startVBot(cfg)
         arm      = true,
         log      = log,
         onForceExit = function() shutdown(0) end,
+        onRelog = function()
+            return LC.relogin(1500)
+        end,
     })
     if not okb then
         log.error('vbot: boot raised: %s', tostring(S))
@@ -839,6 +865,10 @@ local function buildGame(cfg, t)
 
     local s = sender.new(t)
     LC.sender = s
+    if LC.dailyReward then LC.dailyReward:close(); LC.dailyReward = nil end
+    if cfg.dailyReward then
+        LC.dailyReward = dailyReward.new(LC, { itemId = cfg.dailyRewardItem })
+    end
 
     -- A relogin builds a fresh game and calls this again; without dropping the previous
     -- registrations every event would be handled twice (two login packets, two pongs)
@@ -911,6 +941,12 @@ local function buildGame(cfg, t)
         if LC.startBot then LC.startBot() end
     end
     on('gameStart', function() armPing('game started') end)
+    on('gameStart', function()
+        if cfg.dailyReward and LC.dailyReward then
+            local ok, err = LC.dailyReward:open()
+            if not ok then log.warn('daily reward: %s', tostring(err)) end
+        end
+    end)
     on('login', function(d)
         -- 0x17 LoginSuccess carries serverBeat + the GameNewSpeedLaw constants.  The parser
         -- keeps them on itself; the walker's step timing needs them on the STATE, because
@@ -918,6 +954,9 @@ local function buildGame(cfg, t)
         -- rather than by the raw wire speed whenever all three are non-zero.
         if LC.state and d then
             LC.state.speedA, LC.state.speedB, LC.state.speedC = d.speedA, d.speedB, d.speedC
+        end
+        if LC.bot and LC.bot.setCharacterIdentity then
+            LC.bot:setCharacterIdentity(d and d.playerId, cfg.characterName)
         end
         log.debug('[walk] login serverBeat=%s speedA=%s speedB=%s speedC=%s',
                   tostring(d and d.serverBeat), tostring(d and d.speedA),
@@ -944,12 +983,52 @@ local function buildGame(cfg, t)
     on('loginWait',  function(d) log.warn('login wait: %s (%s s)', tostring(d.message), tostring(d.time)) end)
     on('loginAdvice', function(d) log.info('server: %s', tostring(d.message)) end)
     on('sessionEnd', function(d) fatal(0, 'session ended by the server (reason %s)', tostring(d.reason)) end)
-    on('death', function() log.warn('the character has died') end)
+    on('death', function()
+        log.warn('the character has died')
+        if cfg.relogOnDeath and LC.relogin then
+            local result, err = LC.relogin(1500)
+            if result then
+                log.info('death: relogin scheduled in 1500 ms')
+            else
+                log.debug('death: relogin could not be scheduled: %s', tostring(err))
+            end
+        end
+    end)
     on('talk', function(d)
-        log.info('talk [%s] %s: %s', tostring(d.mode), tostring(d.name), tostring(d.text))
+        log.debug('talk [%s] %s: %s', tostring(d.mode), tostring(d.name), tostring(d.text))
     end)
     on('textMessage', function(d)
-        log.info('message [%s] %s', tostring(d.mode), tostring(d.text))
+        if d and (d.mode == 'DamageReceived' or d.mode == 'DamageDealed'
+                  or d.mode == 'Heal') then
+            return
+        end
+        local isDebugMessage = d and (d.mode == 'Loot' or d.mode == 'Exp'
+                          or d.text == 'You are paralyzed.'
+                          or d.text == 'You are exhausted.')
+        local write = isDebugMessage and log.debug or log.info
+        write('message [%s/%s] %s', tostring(d and d.mode), tostring(d and d.modeByte),
+              tostring(d and d.text))
+    end)
+    on('inventoryChange', function(d)
+        local item = d and d.item
+        log.debug('inventory slot=%s id=%s count=%s', tostring(d and d.slot),
+                  tostring(item and item.id), tostring(item and item.count))
+    end)
+    on('containerOpen', function(d)
+        for _, item in ipairs((d and d.items) or {}) do
+            log.debug('container id=%s item=%s count=%s', tostring(d.id),
+                      tostring(item and item.id), tostring(item and item.count))
+        end
+    end)
+    on('containerAddItem', function(d)
+        local item = d and d.item
+        log.debug('container add id=%s slot=%s item=%s count=%s', tostring(d and d.containerId),
+                  tostring(d and d.slot), tostring(item and item.id), tostring(item and item.count))
+    end)
+    on('containerUpdateItem', function(d)
+        local item = d and d.item
+        log.debug('container update id=%s slot=%s item=%s count=%s', tostring(d and d.containerId),
+                  tostring(d and d.slot), tostring(item and item.id), tostring(item and item.count))
     end)
 
     return st, p, s
@@ -1030,6 +1109,8 @@ local function runDryRun(cfg)
         contentRevision = cfg.contentRevision,
         assetsRoot = cfg.assetsRoot,
         pingMs = cfg.pingMs,
+        dailyReward = cfg.dailyReward,
+        dailyRewardItem = cfg.dailyRewardItem,
     }, t)
 
     -- The server side of the same framing code, so a frame we build is a frame
@@ -1297,6 +1378,9 @@ local function openSession(cfg)
         contentRevision = cfg.contentRevision,
         assetsRoot      = cfg.assetsRoot,
         pingMs          = cfg.pingMs,
+        relogOnDeath    = cfg.relogOnDeath,
+        dailyReward     = cfg.dailyReward,
+        dailyRewardItem = cfg.dailyRewardItem,
     }, t)
     -- Keep what a relogin needs and NOT the password: the session key the login reply
     -- gave us is exactly what --session-key takes, so a reconnect needs no second HTTPS

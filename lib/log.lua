@@ -22,6 +22,8 @@ local NAMES  = { 'DEBUG', 'INFO ', 'WARN ', 'ERROR' }
 local threshold = LEVELS.info
 local fileHandle, filePath = nil, nil
 local subscribers = {}
+local ANSI_ERROR = '\27[31m'
+local ANSI_RESET = '\27[0m'
 
 log.levels = LEVELS
 
@@ -74,7 +76,11 @@ local function emit(lv, text)
   if lv < threshold then return end
   local ms = sys.nowMs()
   local line = string.format('[%10.1f] %s %s', ms, NAMES[lv], text)
-  io.stdout:write(line, '\n')
+  if lv == LEVELS.error then
+    io.stdout:write(ANSI_ERROR, line, ANSI_RESET, '\n')
+  else
+    io.stdout:write(line, '\n')
+  end
   io.stdout:flush()
   if fileHandle then
     fileHandle:write(line, '\n')

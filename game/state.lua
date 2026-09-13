@@ -135,9 +135,6 @@ local function newPlayer()
         direction = 0,
         outfit = nil, vocation = 0, blessings = 0,
         isDead = false,
-        -- proto/parser.lua S[0x2A] (SpecialContainer) -- LocalPlayer::isSupplyStashAvailable's
-        -- C++ default is false (localplayer.h:199) until the server sends the byte.
-        supplyStashAvailable = false,
         -- walk model (docs/state-events.md §17); the walker owns these, we just hold them
         serverPos = nil, preWalks = {}, walkLockUntil = 0,
         waitingForServerWalk = false, lastWalkTime = 0,
@@ -156,6 +153,16 @@ function state:reset()
     self.map        = {}   -- ["x,y,z"] = tile
     self.containers = {}   -- [id] = container
     self.channels   = {}   -- [id] = name
+    self.dailyReward = {
+        collectionState = nil,
+        wall = nil,
+        data = nil,
+        history = {},
+    }
+    self.market = {
+        entered = false,
+        browse = nil,
+    }
     -- MUTATE world and world.awareRange IN PLACE.  proto/parser.lua aliases the awareRange
     -- table (`self.aware = state.world.awareRange`), so replacing it here would leave the
     -- parser sizing every later map packet with the PRE-reset range while state reported the

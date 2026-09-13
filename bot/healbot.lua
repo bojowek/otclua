@@ -430,10 +430,13 @@ end
 function H:spellTick()
     if not self:isOn() or not self:playable() then return end
     local p = self:profile()
+    local player = self:player()
+    local level = player and tonumber(player.level) or 0
     local mana = self:mana()
     for i = 1, #p.spellTable do
         local e = p.spellTable[i]                          -- ARRAY ORDER == PRIORITY
-        if e.enabled and (e.cost or 0) < mana then         -- STRICT <
+        if e.enabled and (not e.level or level >= tonumber(e.level))
+            and (e.cost or 0) < mana then                   -- STRICT <
             if self:healSpellCooldownReady(e.spell) then
                 if self:matches(e) then
                     self.counts.spellCasts = self.counts.spellCasts + 1

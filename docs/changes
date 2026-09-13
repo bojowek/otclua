@@ -1,0 +1,736 @@
+vBot 4.8 CLI support — production code changes
+Reproduction record for a different machine. Covers production code only
+(`main.lua`, `shim/.lua`). Test files are listed at the end for reference but their
+contents are not reproduced here.
+Repository root used here: `/home/sabre/otclua/otclua`
+Runtime: LuaJIT 2.1 (on this machine `luajittex --luaonly <file>`)
+Upstream reference inspected online only, never cloned or copied:
+`Vithrax/vBot@09d6816c817f881735ecf78e87e052fcf7c02816` (its `vBot/main.lua`
+declares `local version = "4.8"`)
+Scope decision that drives every change
+The target is headless CLI automation: CaveBot, AttackBot, HealBot, TargetBot,
+looting and their supporting functions. Explicitly out of scope: physical
+keyboard/mouse input, alarms, sound, window flashing, HTTP version checks, and the
+optional BotServer relay. Nothing below adds those; several changes exist purely so
+their absence cannot break startup of a stock profile.
+Summary of files touched
+File
+Status
+Lines
+Purpose
+`shim/profile.lua`
+new
+84
+Resolve user vs stock vBot layouts; derive mounts/overlays
+`shim/resources.lua`
+modified
++150/−9
+Read-only mounts + writable overlays in `g_resources`
+`shim/host.lua`
+modified
++29/−5
+Write allow-list so user state saves while stock stays frozen
+`shim/g_game.lua`
+modified
++22/−3
+Honour server walk refusal (0xB5) and walk wait (0xB6)
+`shim/callbacks.lua`
+modified
++10/−3
+Separate executor-dispatch census from `g_game` signal census
+`shim/patches.lua`
+modified
++36/−13
+Optional, audited CLI adaptation (version-check block)
+`shim/bootstrap.lua`
+modified
++5/−2
+Thread `mounts`/`overlays` through boot
+`main.lua`
+modified
++65/−42
+`--vbot-userdir`, stock-aware read-only logic, shared resolver
+`docs/shim/COMPAT.md`
+modified
++67/−3
+Documents the CLI scope (documentation, not runtime)
+1. `shim/profile.lua` — NEW FILE
+Why it exists
+Before this change `main.lua` hard-coded the assumption that a vBot profile lives at
+`<otRoot>/profiles/bot/<config>`. The stock upstream layout is
+`<otRoot>/mods/game_bot/default_configs/vBot_4.8`, which that parser rejected outright,
+so a stock 4.8 tree could not be selected at all. This module is the single resolver for
+both layouts and it never copies, downloads or creates anything.
+What it supports for vBot
+Selecting a stock `mods/game_bot/default_configs/vBot_4.8` directory.
+Selecting a classic user `profiles/bot/<config>` directory (unchanged behaviour).
+Deriving the otclient root, the `g_resources` write root, the `/bot/<config>` mount,
+and the writable overlay list.
+Environment variables `LUACLIENT_VBOT_PROFILE`, `LUACLIENT_VBOT_OTROOT`,
+`LUACLIENT_VBOT_USERDIR`, with explicit CLI arguments taking precedence.
+Full file content
+```lua
+-- Resolve an existing user profile or stock vBot configuration. No copying,
+-- downloading, or directory creation: stock sources are mounted read-only.
+local M = {}
+local function normalise(path, trustedDefault)
+if type(path) ~= 'string' or path == '' then return nil end
+path = path:gsub('\', '/'):gsub('/+$', '')
+if path:find('%z') then return nil end
+for part in path:gmatch('[^/]+') do
+if part == '..' and not trustedDefault then return nil end
+end
+return path
+end
+local function exists(path)
+local f = io.open(path, 'rb')
+if not f then return false end
+f:close()
+return true
+end
+-- Sub-paths of a stock configuration that hold user state rather than upstream code.
+local USER_STATE = { 'storage', 'vBot_configs', 'cavebot_configs', 'targetbot_configs' }
+-- opts.profileDir / opts.otRoot are explicit and take precedence over the
+-- corresponding environment variables. opts.getenv supports isolated tests.
+-- opts.userDir redirects writes for a stock configuration to the user's own tree.
+function M.resolve(opts)
+opts = opts or {}
+local getenv = opts.getenv or os.getenv
+local rawDir = opts.profileDir or getenv('LUACLIENT_VBOT_PROFILE')
+local rawRoot = opts.otRoot or getenv('LUACLIENT_VBOT_OTROOT')
+local rawUser = opts.userDir or getenv('LUACLIENT_VBOT_USERDIR')
+local dir, otRoot = normalise(rawDir), normalise(rawRoot)
+local userDirOpt = normalise(rawUser)
+if rawDir and not dir then return nil, 'invalid vBot profile directory' end
+if rawRoot and not otRoot then return nil, 'invalid otclient root directory' end
+if rawUser and not userDirOpt then return nil, 'invalid vBot user directory' end
+if not dir and otRoot then
+local userDir = otRoot .. '/profiles/bot/vBot_4.8'
+dir = exists(userDir .. '/_Loader.lua') and userDir
+or otRoot .. '/mods/game_bot/default_configs/vBot_4.8'
+end
+-- The launcher's historical sibling-checkout candidates contain ../..;
+-- preserve those trusted defaults without accepting traversal in CLI/env input.
+dir = dir or normalise(opts.defaultProfile, true)
+if not dir then
+return nil, 'specify --vbot-profile=DIR or --vbot-otroot=DIR (an existing local checkout)'
+end
+local parent, config = dir:match('^(.)/([^/]+)$')
+if not parent or config == '.' or config:find(':', 1, true) then
+return nil, 'invalid vBot profile directory: ' .. dir
+end
+local stockRoot = parent:match('^(.)/mods/game_bot/default_configs$')
+local writeDir = parent:match('^(.)/[Bb]ot$')
+if stockRoot then
+otRoot = otRoot or stockRoot
+writeDir = otRoot .. '/profiles'
+elseif writeDir then
+otRoot = otRoot or writeDir:match('^(.)/[^/]+$')
+else
+return nil, 'vBot profile must be under bot/ or mods/game_bot/default_configs/'
+end
+if not otRoot or otRoot == '' then
+return nil, 'cannot derive the otclient root; pass --vbot-otroot=DIR'
+end
+local overlays
+if stockRoot and userDirOpt then
+writeDir = userDirOpt
+overlays = {}
+for _, name in ipairs(USER_STATE) do
+overlays[#overlays + 1] = '/bot/' .. config .. '/' .. name
+end
+end
+return {
+dir = dir, config = config, otRoot = otRoot, writeDir = writeDir,
+stock = stockRoot ~= nil,
+-- Mount only the selected configuration, not the rest of the checkout.
+mounts = stockRoot and { ['/bot/' .. config] = dir } or nil,
+-- Stock code stays read-only; only these state directories are writable.
+overlays = overlays,
+}
+end
+return M
+```
+Line-by-line rationale
+Lines
+What it does
+Why
+`normalise(path, trustedDefault)`
+Converts `` to `/`, strips trailing slashes, rejects NUL, rejects any `..` segment
+CLI and environment input must not escape the intended tree. `trustedDefault` exists because the launcher's own historical fallback candidates legitimately contain `../..`; only those bypass the `..` rule
+`exists(path)`
+Plain `io.open` probe
+Used to prefer an existing user profile over the stock config when only `--vbot-otroot` is given. Deliberately does not create anything
+`USER_STATE`
+`storage`, `vBot_configs`, `cavebot_configs`, `targetbot_configs`
+These four directories are the only places stock vBot 4.8 keeps user state: bot storage (macro on/off + settings), HealBot/AttackBot JSON, CaveBot `.cfg` routes, TargetBot JSON. Everything else in the tree is upstream code and must stay frozen
+`rawDir/rawRoot/rawUser`
+Explicit option first, environment second
+Explicit CLI beats environment; documented behaviour
+`if not dir and otRoot`
+With only a root, prefer `profiles/bot/vBot_4.8` if it has `_Loader.lua`, else stock `default_configs/vBot_4.8`
+A user who has customised their profile keeps using it; a fresh checkout falls back to the shipped 4.8 config
+`parent, config = dir:match(...)`
+Splits the final path component as the config name
+`config` becomes the `/bot/<config>` virtual directory that upstream `_Loader.lua` and `executor.lua` build paths from
+`config == '.'` / `config:find(':')` guard
+Rejects degenerate names
+`/bot/.` or a drive-letter fragment would produce a nonsense mount
+`stockRoot = parent:match('^(.)/mods/game_bot/default_configs$')`
+Detects the stock layout
+This is the exact upstream directory shape; matching it is what makes stock support possible
+`writeDir = parent:match('^(.)/[Bb]ot$')`
+Detects the classic layout
+`Bb` because Windows checkouts sometimes capitalise `Bot`
+stock branch sets `writeDir = otRoot .. '/profiles'`
+Keeps `g_resources` rooted where the real client roots it
+vBot resolves everything relative to the profiles root
+final `error` when neither matched
+Loud refusal
+Better than silently running with a wrong root
+overlay block
+When stock and `userDir` given, write root becomes `userDir` and the four state paths become overlays
+This is what makes a stock profile usable in practice: it can persist storage and configs without the stock tree ever being written
+`mounts = stockRoot and { ['/bot/'..config] = dir }`
+Mounts only the chosen config
+Not the whole checkout — the mount is deliberately narrow
+2. `shim/resources.lua` — read-only mounts and writable overlays
+Why
+`g_resources` previously mapped every virtual path to `<writeDir><virtualPath>` and
+nothing else. To run a stock vBot tree the loader must read `/bot/vBot_4.8/...` from
+the checkout's `mods/game_bot/default_configs/vBot_4.8` directory while that directory
+stays byte-identical. Mounts provide the read path; overlays provide a writable
+sub-path so user state can still be saved.
+What it supports for vBot
+`_Loader.lua` line 4: `g_resources.listDirectoryFiles("/bot/"..configName.."/vBot", true, false)`
+works against stock sources, including the recursive `.otui` style discovery.
+`executor.lua`'s double-slash paths (`/bot/vBot_4.8//vBot/main.lua`) still resolve.
+`vBotConfigSave(...)`, `CaveBot.save()`, `TargetBot.save()` and bot storage writes
+land in the user's own directory instead of being refused outright.
+Diff
+```diff
+@@ SANDBOX doc block
+Every virtual path resolves to <writeDir> .. <virtualPath> and nothing else.
+Virtual paths resolve beneath writeDir, except explicitly supplied read-only
+directory mounts (used for stock vBot configurations). Mounts shadow the same
+virtual subtree in writeDir; writes and deletion of mount ancestors are refused.
+```
+```diff
+@@ function RES:resolvePath(path)
+return collapse(full)
+full = collapse(full)
+-- Canonicalise harmless dot segments before matching mount boundaries.
+local parts = {}
+for part in full:gmatch('[^/]+') do
+if part ~= '.' then parts[#parts + 1] = part end
+end
+return '/' .. table.concat(parts, '/')
+```
+Why: mount matching is a string-prefix test. Without dropping `.` segments,
+`/bot/./vBot_4.8/vBot/main.lua` would miss the `/bot/vBot_4.8` mount and fall through to
+the write tree, producing a "file not found" for a file that plainly exists. `..` is
+still refused later in `_hostPath`; only the harmless `.` is canonicalised.
+```diff
++local function beneath(path, root)
+return root == '/' or path == root or path:sub(1, #root + 1) == root .. '/'
++end
+
++--- The overlay a virtual path belongs to, or nil. An overlay is a sub-path of a
++--- read-only mount that the user's own writable tree owns instead.
++function RES:_overlay(v)
+for _, overlay in ipairs(self._overlays) do
+if beneath(v, overlay) then return overlay end
+end
+return nil
++end
+
+function RES:_real(path, mode)
+local v = self:resolvePath(path)
+local host_, why = self:_hostPath(v)
+if host_ then return host_, v end
+if host_ then
+local overlaid = self:_overlay(v) ~= nil
+for _, mount in ipairs(self._mounts) do
+if beneath(v, mount.path) then
+-- Inside an overlay the user's copy wins, and stock stays the fallback.
+if overlaid then
+if mode == 'write' or host.isFile(host_) or host.isDir(host_) then
+return host_, v
+end
+return mount.dir .. v:sub(#mount.path + 1), v
+end
+if mode == 'write' then
+self._refusals[v] = 'read-only mount ' .. mount.path
+return nil, v
+end
+return mount.dir .. v:sub(#mount.path + 1), v
+end
+if mode == 'write' and beneath(mount.path, v) then
+self._refusals[v] = 'read-only mount ' .. mount.path
+return nil, v
+end
+end
+return host_, v
+end
+```
+Key semantics, in order of the checks:
+Inside an overlay — writes always go to the user tree; reads prefer the user's
+copy and fall back to the stock file when the user has not saved one yet. This is
+what lets a stock `HealBot.json` be read on first run and a modified one be read
+
+Inside a mount, not overlaid — writes are refused and recorded in `_refusals`;
+reads are redirected to the mounted host directory.
+An ancestor of a mount (e.g. `/bot` when the mount is `/bot/vBot_4.8`) — writes
+and deletes refused, so the mount cannot be removed from underneath.
+Mounts are sorted longest-path-first at construction, so the most specific mount wins.
+```diff
+function RES:fileExists(path)
+local real = self:_real(path, 'predicate')
+local real, v = self:_real(path, 'predicate')
+if not real then return false end
+for _, mount in ipairs(self._mounts) do
+if beneath(mount.path, v) and host.isDir(mount.dir) then return false end
+end
+return host.isFile(real)
+end
+function RES:directoryExists(path)
+local real = self:_real(path, 'predicate')
+local real, v = self:_real(path, 'predicate')
+if not real then return false end
+for _, mount in ipairs(self._mounts) do
+if beneath(mount.path, v) and host.isDir(mount.dir) then return true end
+end
+return host.isDir(real)
+end
+```
+Why: the virtual parents of a mount must behave like directories even when they do not
+exist on disk. With a mount at `/bot/vBot_4.8` and no real `profiles/bot` directory,
+`directoryExists('/bot')` must be true and `fileExists('/bot')` must be false —
+`bot.lua` discriminates on exactly that pair.
+```diff
+local names = host.list(real)
+if not raw then
+-- An overlaid directory exists in both trees; the union is what the bot sees.
+if self:_overlay(path) then
+... merge the entries of the counterpart directory ...
+end
+-- A mount also exposes its virtual parent directories, even when the
+-- user has never created a profiles/bot directory on disk.
+local seen = {}
+for _, name in ipairs(names) do seen[name] = true end
+for _, mount in ipairs(self._mounts) do
+if mount.path ~= path and beneath(mount.path, path) and host.isDir(mount.dir) then
+local suffix = mount.path:sub(path == '/' and 2 or #path + 2)
+local name = suffix:match('^[^/]+')
+if name and not seen[name] then
+names[#names + 1] = name
+seen[name] = true
+end
+end
+end
+end
+```
+Why the union matters for vBot: CaveBot and TargetBot list their config directories to
+build the profile dropdowns. Without merging, a user who saves one route into the
+overlay would see only that route and lose every shipped one. The existing sort at the
+end of the function is untouched, so ordering stays byte-wise as upstream expects.
+```diff
+function RES:readFileContents(path)
+local real = self:_real(path, 'read')
+local real, v = self:_real(path, 'read')
+for _, mount in ipairs(self._mounts) do
+if beneath(mount.path, v) and host.isDir(mount.dir) then
+error(("unable to read file '%s': is a mounted directory"):format(v), 2)
+end
+end
+```
+Why: reading a virtual mount parent as a file must raise, matching the C++ behaviour
+that `bot.lua` and `vBot/configs.lua` wrap in `pcall`.
+```diff
+function RES:makeDir(path)
+local real = self:_real(path, 'write')
+if not real then return false end
+function RES:writeFileContents(path, data)
+local real = self:_real(path, 'write')
+if not real then return false end
+function RES:deleteFile(path)
+local real = self:_real(path, 'write')
+if not real then return false end
+```
+Why: `_real` now returns `nil` for a refused write. Without these guards the refusal
+would be a crash inside `io.open(nil)` instead of the `false` the real `g_resources`
+returns on failure — and vBot calls these without `pcall`.
+```diff
+local impl = setmetatable({
+...
+_mounts = {},
+_overlays = {},
+}, RES)
+for virtual, dir in pairs(opts.mounts or {}) do
+-- validate shape, resolve, reject '/' and duplicates
+impl._mounts[#impl._mounts + 1] = { path = path, dir = dir:gsub('\','/'):gsub('/+$','') }
+end
+table.sort(impl._mounts, function(a, b) return #a.path > #b.path end)
+
+for _, virtual in ipairs(opts.overlays or {}) do
+-- An overlay equal to (or above) a mount would unlock the whole stock tree.
+if beneath(path, mount.path) and path ~= mount.path then inside = true end
+if not inside then
+error('resources.new: overlay must be inside a mount: ' .. virtual, 2)
+end
+impl._overlays[#impl._overlays + 1] = path
+end
+```
+The overlay validation is the security-relevant part: an overlay of `/bot/vBot_4.8` or
+`/bot` would make the entire stock tree writable, defeating the whole point, so both are
+rejected at construction time rather than at first write.
+Not changed: the sandbox remains lexical. A symlink planted inside the profile can
+still point outside it, exactly as documented before and exactly as PhysFS behaves.
+3. `shim/host.lua` — write allow-list
+Why
+The host's read-only guard was all-or-nothing: either every `g_resources` write was
+refused, or `--vbot-write` unlocked everything. With stock sources that meant bot storage
+could never be persisted at all, so macro on/off state and every configuration edit was
+lost on exit.
+Diff
+```diff
+h.readOnly = opts.readOnly ~= false
+-- Virtual prefixes that stay writable in readOnly mode (the user's own overlay).
+h.writeAllow = opts.writeAllow or {}
+```
+```diff
+local log = self.log
+local allow = self.writeAllow or {}
+local function permitted(path)
+if type(path) ~= 'string' then return false end
+local ok, v = pcall(res.resolvePath, path)
+if not ok or type(v) ~= 'string' then return false end
+for _, prefix in ipairs(allow) do
+if v == prefix or v:sub(1, #prefix + 1) == prefix .. '/' then return true end
+end
+return false
+end
+local function refuse(what)
+local real = res[what]
+return function(path, ...)
+if permitted(path) then return real(path, ...) end
+blocked[#blocked + 1] = what .. ' ' .. tostring(path)
+```
+Details that matter:
+`res.resolvePath` is applied before matching, so `/bot/vBot_4.8//storage/x.json`
+and `/bot/./vBot_4.8/storage/x.json` are matched the same way the resources layer will
+ultimately resolve them. Matching raw argument strings would be bypassable.
+The prefix test requires either an exact match or a following `/`. A sibling path such
+as `/bot/vBot_4.8/storage-elsewhere.json` therefore does not match
+
+`local real = res[what]` is captured when the guard is installed, i.e. before the
+wrapper replaces the field, so an allowed write reaches the genuine implementation.
+Every refusal is still appended to `blockedWrites`; nothing became silent.
+```diff
+function H:saveStorage()
+if not self.context then return false, 'not started' end
+if self.readOnly then
+self.blockedWrites[...] = 'saveStorage ' .. self:_storagePath()
+local path = self:_storagePath()
+if self.readOnly and not self:_writeAllowed(path) then
+self.blockedWrites[...] = 'saveStorage ' .. path
+return false, 'read-only'
+end
+
+return res.writeFileContents(self:_storagePath(), txt) and true or false
+return res.writeFileContents(path, txt) and true or false
++end
+
++--- True when `path` is inside a configured writable overlay prefix.
++function H:_writeAllowed(path)
+for _, prefix in ipairs(self.writeAllow or {}) do
+if path == prefix or path:sub(1, #prefix + 1) == prefix .. '/' then return true end
+end
+return false
+end
+```
+What this supports for vBot: `/bot/<config>/storage/profile_<N>.json` carries
+`_macros` — the user's own macro on/off switches. Persisting it is what makes a CLI
+session resumable instead of resetting every macro on each start.
+4. `shim/g_game.lua` — server walk responses
+Why (this is the one real gameplay-correctness fix)
+The shim maintained an optimistic pre-walk queue and only cleared it on a timeout
+(step duration + ping, capped at 1000 ms). The two server packets that answer a walk were
+parsed but never applied to the player model:
+`0xB5 CancelWalk` — the server refused/undid the step.
+`0xB6 WalkWait` — the server imposes a pause.
+Consequences before the fix: after a refused step, `player:getPosition()` kept reporting
+a tile the character never reached for up to a second, and every CaveBot/TargetBot
+decision taken in that window used the wrong position. During a walk-wait the bot kept
+sending walk packets that could not succeed.
+Diff
+```diff
+-- Game::processWalkCancel -> LocalPlayer::cancelWalk: the server REFUSED the step, so
+-- the optimistic tile has to go now. Waiting for the prewalk timeout instead left
+-- getPosition() reporting a tile the character never reached for up to a second, and
+-- every bot decision in that window used it.
+local cancelHandle, waitHandle
+if LC.events and LC.events.on then
+cancelHandle = busOn(LC.events, 'walkCancel', function() clearPreWalks() end)
+-- Game::processWalkWait -> LocalPlayer::lockWalk(millis): a server-imposed pause.
+waitHandle = busOn(LC.events, 'walkWait', function(d)
+local ms = d and tonumber(d.millis)
+if not ms or ms <= 0 then return end
+local player = reg:localPlayer()
+if player and player.lockWalk then pcall(player.lockWalk, player, ms) end
+end)
+end
+```
+```diff
+function g._shutdown()
+if posHandle and LC.events and LC.events.off then busOff(LC.events, posHandle) end
+posHandle = nil
+if LC.events and LC.events.off then
+for _, h in pairs({ posHandle, cancelHandle, waitHandle }) do busOff(LC.events, h) end
+end
+posHandle, cancelHandle, waitHandle = nil, nil, nil
+```
+Notes:
+`busOn` already supports both the module form (`bus.on`) and the instance form
+(`bus:on`) used by the hub worker and tests; the new handlers reuse it unchanged.
+`pairs({...})` on the handle list skips `nil` entries, so shutdown is safe when the
+event bus was absent at construction.
+`lockWalk`/`isWalkLocked`/`canWalk` already existed in `shim/creature.lua`; nothing
+called `lockWalk` before, so this wires up existing but dead machinery.
+The parser already emitted both events (`proto/parser.lua`, `S[0xB5]`, `S[0xB6]`);
+the native bot layer (`bot/walker.lua`) already consumed `walkCancel`. Only the shim
+path — the one that runs real vBot — was missing it.
+5. `shim/callbacks.lua` — census separation
+Why
+`fire()` (executor callback dispatch) and `gsignal()` (the `connect(g_game, {...})`
+fan-out) both incremented the same `fired`/`dropped` counters. Because vBot connects to
+`g_game` for some of the very same event names, one parser event was counted twice, so
+the diagnostic census could not answer "did the executor callback run?" at all.
+Diff
+```diff
++--- `fired`/`dropped` count EXECUTOR dispatches; `signalled`/`signalDropped` count the
++--- separate `connect(g_game, ...)` fan-out, which shares event names but not channels.
+function Handle:stats()
+return { fired = self.fired, dropped = self.dropped, wired = self.wired }
+return { fired = self.fired, dropped = self.dropped, wired = self.wired,
+signalled = self.signalled, signalDropped = self.signalDropped }
+end
+```
+```diff
+fired = {}, dropped = {}, wired = {},
+signalled = {}, signalDropped = {},
+```
+```diff
+local function gsignal(name, ...)
+local slot = gg and rawget(gg, name)
+if slot == nil then
+H.dropped[name] = (H.dropped[name] or 0) + 1
+H.signalDropped[name] = (H.signalDropped[name] or 0) + 1
+return
+end
+H.fired[name] = (H.fired[name] or 0) + 1
+H.signalled[name] = (H.signalled[name] or 0) + 1
+```
+Behaviour is otherwise identical: both channels still dispatch, still `pcall`, still log
+a raising callback. Only the accounting changed. This is diagnostics, not gameplay, but
+it is what makes "is this vBot callback actually firing?" answerable when debugging a CLI
+session.
+6. `shim/patches.lua` — optional CLI adaptation
+Why
+Stock `vBot/main.lua` runs an update check at load:
+```lua
+if os.time() > storage.checkVersion + (12 * 60 * 60) then
+storage.checkVersion = os.time()
+HTTP.get("https://raw.githubusercontent.com/Vithrax/vBot/main/vBot/version.txt", ...)
+end
+```
+The shim deliberately installs no HTTP API (`shim/bootstrap.lua` sets `G.HTTP = nil`),
+because HTTP is out of scope for CLI automation. With empty storage (`checkVersion = 0`)
+that branch is taken on the first run and the missing global aborts profile loading.
+The existing patch mechanism could not express this: every entry was mandatory and raised
+when its text was absent, which would break any custom profile that does not contain the
+updater.
+Diff
+```diff
++-- Optional CLI-only adaptations, separate from the mandatory object-model
++-- fixes above. A profile may omit these features entirely; absence is not drift.
++-- Only the exact known block is adapted, never arbitrary HTTP calls or scripts.
++-- Reference: Vithrax/vBot@09d6816c817f881735ecf78e87e052fcf7c02816.
++patches.OPTIONAL = {
+['/vBot/main.lua'] = {
+{
+expected = 'if os.time() > storage.checkVersion + (12 * 60 * 60) then',
+replacement = 'if false then -- CLI: optional vBot update check disabled',
+why = 'CLI automation excludes the optional HTTP version check; no HTTP API is installed',
+},
+},
++}
+```
+```diff
+function patches.has(virtualPath)
+return patches.LIST[virtualPath] ~= nil
+return patches.LIST[virtualPath] ~= nil or patches.OPTIONAL[virtualPath] ~= nil
+end
+```
+```diff
+function patches.apply(src, virtualPath, notes)
+local list = patches.LIST[virtualPath]
+local list = patches.LIST[virtualPath] or patches.OPTIONAL[virtualPath]
+local optional = patches.LIST[virtualPath] == nil
+if not list or type(src) ~= 'string' then return src end
+for _, p in ipairs(list) do
+local from, to = src:find(p.expected, 1, true)
+if not from then
+if not from and not optional then
+upstream drifted ...)
+end
+if src:find(p.expected, to + 1, true) then
+error(... matches more than once ...)
+if from then
+if src:find(p.expected, to + 1, true) then
+error(... matches more than once ...)
+end
+src = src:sub(1, from - 1) .. p.replacement .. src:sub(to + 1)
+if notes then notes[#notes + 1] = virtualPath .. ': ' .. p.why end
+end
+src = ...
+end
+return src
+end
+```
+Deliberate properties:
+Mandatory patches are unchanged: a missing `expected` in `functions/map.lua`,
+`functions/ui_elements.lua` or `/vBot/training.lua` still raises loudly. Drift
+detection is intact.
+Optional patches tolerate absence but still raise on a duplicate match, because
+rewriting an ambiguous signature is worse than not rewriting at all.
+The replacement is `if false then`, which keeps the block syntactically valid and the
+`end` balanced. Nothing else in `main.lua` is touched, so the UI labels and the rest of
+the script load normally.
+This is not a general HTTP suppressor: an unrelated `HTTP.get` line elsewhere is
+left exactly as written and will still fail loudly.
+Upstream files on disk are never modified (invariant I9); the rewrite is in memory on
+the way to `load`.
+Also fixed in this file: the indentation of the new block and of `patches.apply` was
+normalised to the file's 4-space style.
+7. `shim/bootstrap.lua` — threading the new options
+```diff
+--- opts.writeDir the g_resources root default <otRoot>/profiles
++--- opts.mounts read-only virtual directory -> host directory mappings
++--- opts.overlays writable sub-paths of a mount (user storage/configs)
+```
+```diff
+G.g_resources = resources.new(writeDir)
+G.g_resources = resources.new(writeDir, { mounts = opts.mounts, overlays = opts.overlays })
+```
+```diff
+readOnly = opts.readOnly ~= false,
+writeAllow = opts.overlays,
+```
+The overlay list is the single source of truth: the same array both configures the
+resources layer and defines the host guard's allow-list, so the two cannot disagree.
+8. `main.lua` — CLI surface
+8.1 Help text
+```diff
+--vbot-profile=DIR the /bot/<config> directory to run, e.g.
+.../otclient/profiles/bot/vBot_4.8. Implies --vbot.
+--vbot-profile=DIR an existing profiles/bot/<config> or
+mods/game_bot/default_configs/vBot_4.8 directory. Implies
+--vbot. Stock configurations are always read-only.
+--vbot-otroot=DIR override the otclient checkout (READ-ONLY) the shim reads
+mods/game_bot and modules/ from
+mods/game_bot and modules/ from. With no profile,
+selects profiles/bot/vBot_4.8, then the stock config.
+Environment: LUACLIENT_VBOT_PROFILE / LUACLIENT_VBOT_OTROOT.
+--vbot-userdir=DIR keep a stock configuration read-only but persist storage,
+vBot_configs, cavebot_configs and targetbot_configs under
+DIR. Requires --vbot-write to actually save.
+Environment: LUACLIENT_VBOT_USERDIR.
+```
+8.2 Argument parsing
+```diff
+or name == 'vbot-profile' or name == 'vbot-otroot'
+or name == 'vbot-profile' or name == 'vbot-otroot' or name == 'vbot-userdir'
+```
+```diff
+elseif name == 'vbot-userdir' then
+if type(v) ~= 'string' or v == '' then
+return nil, '--vbot-userdir needs a directory'
+end
+for part in tostring(v):gmatch('[^/\]+') do
+if part == '..' then
+return nil, '--vbot-userdir must not contain a ".." path component'
+end
+end
+cfg.vbotUserDir = v
+cfg.vbot = true
+```
+The `..` rejection mirrors the existing rule for `--bot-profile` and `--vbot-profile`;
+the value becomes a write root, so traversal would redirect writes outside the tree.
+8.3 Path resolution replaced by the shared resolver
+```diff
+-local function resolveVBotPaths(cfg)
+local dir = cfg.vbotProfile or defaultBotProfile()
+... 20 lines that only understood <profiles>/bot/<config> ...
+-end
++local function resolveVBotPaths(cfg)
+return require('shim.profile').resolve({
+profileDir = cfg.vbotProfile, otRoot = cfg.vbotOtRoot,
+userDir = cfg.vbotUserDir,
+defaultProfile = defaultBotProfile(),
+})
++end
+```
+This deletion is the change that actually unblocks stock vBot 4.8: the old parser
+returned an error for any directory not under `bot/`.
+8.4 Startup
+```diff
+if paths.stock and cfg.vbotWrite and not paths.overlays then
+log.warn('vbot: stock configuration is read-only; --vbot-write cannot modify it '
+.. '(use --vbot-userdir=DIR to keep your own storage and configs)')
+end
+```
+```diff
+local readOnly = (not cfg.vbotWrite) or (cfg.dryRun and true or false)
+local readOnly = paths.stock or (not cfg.vbotWrite) or (cfg.dryRun and true or false)
+-- Stock sources stay immutable either way; the overlay only unlocks user state.
+local overlays = (cfg.vbotWrite and not cfg.dryRun) and paths.overlays or nil
+```
+```diff
+otRoot = paths.otRoot,
+writeDir = paths.writeDir,
+mounts = paths.mounts,
+overlays = overlays,
+```
+Resulting policy:
+Invocation
+Stock files
+User state
+stock profile, no `--vbot-write`
+read-only
+not saved
+stock profile, `--vbot-write`, no `--vbot-userdir`
+read-only (warned)
+not saved
+stock profile, `--vbot-write` + `--vbot-userdir=DIR`
+read-only
+saved under `DIR`
+classic user profile, `--vbot-write`
+writable as before
+saved as before
+any profile with `--dry-run`
+read-only
+not saved
+Reproducing on another machine
+Copy the eight production files listed in the summary table (or apply the diffs above).
+Nothing else is required: no new dependencies, no generated assets, no downloads.
+Provide an existing otclient checkout yourself. The runtime still needs
+`mods/game_bot/executor.lua`, `functions/`, `panels/` and `modules/` — a vBot
+configuration directory alone is not a runtime.
+Typical CLI invocations:
+```bash
+stock config, read-only
+luajit main.lua --vbot-otroot=/path/to/otclient
+stock config with persistent user state
+luajit main.lua --vbot-profile=/path/to/otclient/mods/game_bot/default_configs/vBot_4.8 \
+--vbo

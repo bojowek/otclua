@@ -48,6 +48,8 @@ local realMs = (ok_sys and sys and sys.nowMs) or function() return os.clock() * 
 local shared = require('bot.shared')
 local ok_spells, SPELLDB = pcall(require, 'data.spells1530')
 if not ok_spells or type(SPELLDB) ~= 'table' then SPELLDB = {} end
+local ok_items, ITEMDB = pcall(require, 'proto.items')
+if not ok_items or type(ITEMDB) ~= 'table' then ITEMDB = {} end
 
 -- ---------------------------------------------------------------------------
 -- constants restated for the sandbox (functions/const.lua:3-10, 12-18, 20-33 --
@@ -214,46 +216,6 @@ function api.new(b)
     ctx.vocation = ctx.voc
     ctx.bless  = function() local p = player(); return p and p.blessings or 0 end
     ctx.blessings = ctx.bless
-
-    -- CONFIGAPI.md work item N1: getStance()/getSecondaryStance() are not stored on the
-    -- wire as such -- they are derived from state.player.virtues by
-    -- protocolgameparse.cpp:5385-5404 (311/312 always occupy the secondary slot, the
-    -- first OTHER id seen is primary, the next free slot takes secondary, and a third id
-    -- is discarded).  Ported verbatim from shim/creature.lua's local `stances()` helper
-    -- so the sandbox and bot/stances.lua (the native module) derive the SAME answer from
-    -- the SAME rule -- one source of truth, as CONFIGAPI.md asks.  proto/parser.lua's
-    -- 0xC1 sub=2 handler only ever writes `.virtues`, never `.stance`/`.secondaryStance`
-    -- directly, but a future wire change that does IS honoured first, exactly like the
-    -- shim.
-    local function deriveStances()
-        local p = player()
-        if type(p) == 'table' and type(p.stance) == 'number' then
-            local sec = p.secondaryStance
-            return p.stance, (type(sec) == 'number' and sec or 0)
-        end
-        local v = p and p.virtues
-        local primary, secondary = 0, 0
-        if type(v) == 'table' then
-            for i = 1, #v do
-                local id = v[i]
-                if id == 311 or id == 312 then secondary = id
-                elseif primary == 0 then primary = id
-                elseif secondary == 0 then secondary = id end
-            end
-        end
-        return primary, secondary
-    end
-    ctx.getStance = function() return (deriveStances()) end
-    ctx.getSecondaryStance = function() local _, secondary = deriveStances(); return secondary end
-    ctx.getVirtues = function()
-        local p = player()
-        local v = p and p.virtues
-        if type(v) ~= 'table' then return {} end
-        local out = {}
-        for i = 1, #v do out[i] = v[i] end
-        return out
-    end
-
     -- REVIEW FIX: the wire only writes the player's facing onto
     -- state.creatures[<playerId>] (proto/parser.lua applyCreature); state.player.direction
     -- is touched only by 0xB5 walkCancel.
@@ -500,6 +462,11 @@ function api.new(b)
     ctx.getFinger = function() return ctx.getInventoryItem(9) end
     ctx.getAmmo   = function() return ctx.getInventoryItem(10) end
     ctx.getPurse  = function() return ctx.getInventoryItem(11) end
+    ctx.isContainerItem = function(itemOrId)
+        local id = type(itemOrId) == 'number' and itemOrId or
+                   (type(itemOrId) == 'table' and itemOrId.id) or nil
+        return id ~= nil and type(ITEMDB.isContainer) == 'function' and ITEMDB.isContainer(id) or false
+    end
 
     ctx.getContainers = function()
         local s = st()
@@ -512,6 +479,32 @@ function api.new(b)
         return out
     end
     ctx.getContainer = function(i) return ctx.getContainers()[i] end
+    ctx.getContainerByName = function(name, notFull)
+        if type(name) ~= 'string' then return nil end
+        local wanted = name:lower()
+        local function itemView(item)
+            return setmetatable({ getId = function() return item.id end,
+                                  getName = function() return item.name end,
+                                  getCount = function() return item.count or 1 end },
+                                { __index = item })
+        end
+        for _, container in ipairs(ctx.getContainers()) do
+            if tostring(container.name or ''):lower() == wanted then
+                local items = container.items or {}
+                if not notFull or #items < (container.capacity or math.huge) then
+                    return setmetatable({
+                        getName = function() return container.name end,
+                        getItems = function()
+                            local result = {}
+                            for i, item in ipairs(items) do result[i] = itemView(item) end
+                            return result
+                        end,
+                    }, { __index = container })
+                end
+            end
+        end
+        return nil
+    end
 
     --- getBackpacks(): open containers, minus the ones that are not carried
     --- (depot/loot channels keep their own names).  A container the server
@@ -738,12 +731,36 @@ function api.new(b)
                                parentContainerId or 0)
     end
 
+    ctx.g_game = {
+        isOnline = function() return b.inGame and true or false end,
+        getLocalPlayer = function() return player() end,
+        open = function(item, parent)
+            return ctx.openContainer(item, parent and parent.id)
+        end,
+        move = function(item, destination, count)
+            return ctx.moveItem(item, destination, count)
+        end,
+        equipItemId = function(itemId, tier)
+            local s = snd(); if not s then return nil, 'no sender' end
+            if type(itemId) ~= 'number' then return nil, 'equipItemId: invalid item id' end
+            return s:equipItem(itemId, tier or 0)
+        end,
+    }
+
     ctx.closeContainer = function(container)
         local s = snd(); if not s then return nil, 'no sender' end
         local id = type(container) == 'number' and container or
                    (type(container) == 'table' and container.id) or nil
         if not id then return nil, 'closeContainer: no container id' end
         return s:closeContainer(id)
+    end
+
+    ctx.seekInContainer = function(container, index, filter)
+        local s = snd(); if not s then return nil, 'no sender' end
+        local id = type(container) == 'number' and container or
+                   (type(container) == 'table' and container.id) or nil
+        if not id then return nil, 'seekInContainer: no container id' end
+        return s:seekInContainer(id, index or 0, filter or 0)
     end
 
     -- ---- deliberate no-ops (see the header) --------------------------------

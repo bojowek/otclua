@@ -720,7 +720,10 @@ function bootstrap.start(LC, opts)
     end)
     step('resources', function()
         local resources = require('shim.resources')
-        G.g_resources = resources.new(writeDir)
+        G.g_resources = resources.new(writeDir, {
+            mounts = opts.mounts,
+            overlays = opts.overlays,
+        })
         S.resources = G.g_resources
     end)
     step('settings', function()
@@ -845,6 +848,7 @@ function bootstrap.start(LC, opts)
         G = G, LC = LC, resources = G.g_resources, otRoot = otRoot,
         config = S.config, profile = tonumber(opts.profile) or 1,
         readOnly = opts.readOnly ~= false,
+        writeAllow = opts.overlays,
         storage = opts.storage,
         log = log,
         mkWidget = function(style) return G.g_ui.createWidget(style) end,

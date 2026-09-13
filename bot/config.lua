@@ -95,7 +95,8 @@ API
   c:loadHealBot()   c:saveHealBot(t)
   c:loadAttackBot() c:saveAttackBot(t)
   c:loadSupplies()  c:saveSupplies(t)
-  c:loadStorage()   c:saveStorage(t)
+    c:loadStorage()   c:saveStorage(t)
+    c:loadCharacterData() c:saveCharacterData(name, t)
   c:listCavebots()  c:loadCavebot(name)   c:saveCavebot(name, data)
   c:listTargetbots() c:loadTargetbot(name) c:saveTargetbot(name, t)
   c:summary()       -- counts, for the report / web panel
@@ -751,6 +752,8 @@ function config.new(opts)
     local self = setmetatable({}, Profile)
     self.dir      = opts.profileDir and norm(opts.profileDir) or nil
     self.vprofile = tonumber(opts.vprofile) or 1
+    self.characterId = tonumber(opts.characterId)
+    self.characterName = opts.characterName
     self.log      = mklog(opts.log)
     return self
 end
@@ -767,6 +770,17 @@ function Profile:suppliesPath()  return self:path('vBot_configs', 'profile_' .. 
 function Profile:storagePath()   return self:path('storage', 'profile_' .. self.vprofile .. '.json') end
 function Profile:cavebotDir()    return self:path('cavebot_configs') end
 function Profile:targetbotDir()  return self:path('targetbot_configs') end
+
+function Profile:characterdataDir()
+    if not self.characterId or self.characterId < 1 then return nil end
+    return self:path('characterdata', tostring(math.floor(self.characterId)))
+end
+
+function Profile:characterDataPath(name)
+    if type(name) ~= 'string' or not name:match('^[%w_%-]+%.json$') then return nil end
+    local dir = self:characterdataDir()
+    return dir and config.join(dir, name) or nil
+end
 
 -- Config.load semantics (VERIFIER): BOTH branches are pcall'd; a parse failure
 -- LOGS and returns {} -- it does NOT raise.  Only a genuinely missing file is an
@@ -829,6 +843,16 @@ function Profile:loadStorage()
 end
 
 function Profile:saveStorage(t) return self:_saveJson(self:storagePath(), t, 'storage') end
+
+function Profile:loadCharacterData(name)
+    return self:_loadJson(self:characterDataPath(name or 'blacklist.json'),
+                          'characterdata/' .. tostring(name or 'blacklist.json'))
+end
+
+function Profile:saveCharacterData(name, data)
+    return self:_saveJson(self:characterDataPath(name or 'blacklist.json'), data,
+                          'characterdata/' .. tostring(name or 'blacklist.json'))
+end
 
 -- ---- cavebot ---------------------------------------------------------------
 function Profile:listCavebots()   return config.listConfigs(self:cavebotDir()) end

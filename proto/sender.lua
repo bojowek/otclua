@@ -58,6 +58,9 @@ local OP = {
     UpContainer           = 0x88,
     Look                  = 0x8C,
     LookCreature          = 0x8D,
+    SendQuickLoot         = 0x8F,
+    LootContainer         = 0x90,
+    QuickLootBlackWhitelist = 0x91,
     Talk                  = 0x96,
     RequestChannels       = 0x97,
     JoinChannel           = 0x98,
@@ -65,8 +68,6 @@ local OP = {
     ChangeFightModes      = 0xA0,
     Attack                = 0xA1,
     Follow                = 0xA2,
-    InviteToParty         = 0xA3,
-    JoinParty             = 0xA4,
     CancelAttackAndFollow = 0xBE,
     SeekInContainer       = 0xCC,
     RequestOutfit         = 0xD2,
@@ -81,10 +82,13 @@ local OP = {
     ApplyImbuement        = 0xD5,
     ClearImbuement        = 0xD6,
     CloseImbuingWindow    = 0xD7,
-    -- supply stash (protocolcodes.h:268 -- ClientUseStash shares one opcode with withdraw)
-    UseStash              = 0x28,
-    -- exaltation forge (protocolcodes.h:362)
-    ForgeEnter            = 0xBF,
+    OpenRewardWall         = 0xD8,
+    GetRewardDaily         = 0xDA,
+    MarketLeave            = 0xF4,
+    MarketBrowse           = 0xF5,
+    MarketCreate           = 0xF6,
+    MarketCancel           = 0xF7,
+    MarketAccept           = 0xF8,
 }
 sender.OPCODES = OP
 
@@ -504,23 +508,6 @@ function sender:cancelAttackAndFollow()
     return self:_send(op(self, OP.CancelAttackAndFollow))
 end
 
--- ---------------------------------------------------------------------------
--- party
--- ---------------------------------------------------------------------------
--- 0xA3 / 0xA4: u32 creatureId (protocolgamesend.cpp:843-857 sendInviteToParty /
--- sendJoinParty -- identical one-field bodies, only the opcode differs).
-function sender:partyInvite(creatureId)
-    local w = op(self, OP.InviteToParty)
-    w:u32(math.floor(creatureId or 0))
-    return self:_send(w)
-end
-
-function sender:partyJoin(creatureId)
-    local w = op(self, OP.JoinParty)
-    w:u32(math.floor(creatureId or 0))
-    return self:_send(w)
-end
-
 -- 0xA0: GameTacticsWithoutFightMode (136) is ON at 1530, so the fightMode byte is OMITTED.
 -- Field order and values (protocolgamesend.cpp:800-822):
 --   u8 chaseMode  0 DontChase, 1 ChaseOpponent
@@ -556,6 +543,46 @@ end
 function sender:upContainer(id)
     local w = op(self, OP.UpContainer)
     w:u8(id)
+    return self:_send(w)
+end
+
+-- 0x8F ClientSendQuickLoot: variant, Position, and item fields for non-tile variants.
+function sender:sendQuickLoot(variant, pos, itemId, stackpos)
+    local v = u8arg(variant)
+    local w = op(self, OP.SendQuickLoot)
+    w:u8(v)
+    writePos(w, pos)
+    if v ~= 2 then
+        w:u16(math.floor(itemId or 0))
+        w:u8(u8arg(stackpos))
+    end
+    return self:_send(w)
+end
+
+-- 0x91 ClientQuickLootBlackWhitelist (protocolgamesend.cpp:1910):
+--   u8 filter  0 = skipped (blacklist), 1 = accepted (whitelist)
+--   u16 size, size x u16 itemId
+-- The sent array REPLACES that filter's server list and selects it as the
+-- active Quick Loot mode. An empty skip list therefore means "loot everything";
+-- an accepted list means "loot only these IDs".
+function sender:quickLootBlackWhitelist(filter, itemIds)
+    filter = u8arg(filter, 0)
+    if filter ~= 0 and filter ~= 1 then
+        error('sender:quickLootBlackWhitelist: filter must be 0 (skip) or 1 (accept)', 2)
+    end
+    if itemIds ~= nil and type(itemIds) ~= 'table' then
+        error('sender:quickLootBlackWhitelist: itemIds must be an array', 2)
+    end
+    local n = itemIds and #itemIds or 0
+    if n > 65535 then n = 65535 end
+    local w = op(self, OP.QuickLootBlackWhitelist)
+    w:u8(filter)
+    w:u16(n)
+    for i = 1, n do
+        local id = tonumber(itemIds[i]) or 0
+        if id < 0 then id = 0 end
+        w:u16(math.floor(id))
+    end
     return self:_send(w)
 end
 
@@ -682,6 +709,72 @@ function sender:closeImbuingWindow()
     return self:_send(op(self, OP.CloseImbuingWindow))
 end
 
+-- 0xD8: open the daily reward wall.  The server supplies the reward data in
+-- response; the request itself has no payload.
+function sender:sendOpenRewardWall()
+    return self:_send(op(self, OP.OpenRewardWall))
+end
+
+-- 0xDA: claim a daily reward.  `items` is an itemId -> count map.  Sorting
+-- keeps captures and tests stable without changing the wire contract.
+function sender:sendGetRewardDaily(bonusShrine, items)
+    if type(items) ~= 'table' then
+        error('sender:sendGetRewardDaily: items must be a table', 2)
+    end
+
+    local itemIds = {}
+    for itemId, count in pairs(items) do
+        if type(itemId) ~= 'number' or type(count) ~= 'number' then
+            error('sender:sendGetRewardDaily: items must map numbers to numbers', 2)
+        end
+        itemIds[#itemIds + 1] = itemId
+    end
+    table.sort(itemIds)
+    if #itemIds > 255 then
+        error('sender:sendGetRewardDaily: too many items', 2)
+    end
+
+    local w = op(self, OP.GetRewardDaily)
+    w:u8(boolByte(bonusShrine))
+    w:u8(#itemIds)
+    for _, itemId in ipairs(itemIds) do
+        w:u16(itemId)
+        w:u8(items[itemId])
+    end
+    return self:_send(w)
+end
+
+function sender:requestGetRewardDaily(bonusShrine, items)
+    return self:sendGetRewardDaily(bonusShrine, items)
+end
+
+-- 0xF4: empty
+function sender:marketLeave()
+    return self:_send(op(self, OP.MarketLeave))
+end
+
+-- 0xF5: u8 browse id; a positive browse type adds a u16 browse type. Browse id 3
+-- optionally carries the classified item's tier.
+function sender:marketBrowse(browseId, browseType, tier, classified)
+    local id = u8arg(browseId)
+    local w = op(self, OP.MarketBrowse)
+    w:u8(id)
+    if tonumber(browseType or 0) > 0 then
+        w:u16(math.floor(browseType or 0))
+        if id == 3 and classified then w:u8(u8arg(tier)) end
+    end
+    return self:_send(w)
+end
+
+-- 0xF8: u32 timestamp, u16 counter, u16 amount
+function sender:marketAccept(timestamp, counter, amount)
+    local w = op(self, OP.MarketAccept)
+    w:u32(math.floor(timestamp or 0))
+    w:u16(u8arg(counter))
+    w:u16(math.floor(amount or 0))
+    return self:_send(w)
+end
+
 -- 0xB2: u8 type; when type == 1 (SELECT_ITEM) also Position(5), u16 itemId, u8 stackpos.
 -- Otc::IMBUEMENT_WINDOW_CHOICE = 0, SELECT_ITEM = 1, SCROLL = 2 (const.h:992-994).
 function sender:imbuementWindowAction(actionType, itemId, pos, stackpos)
@@ -699,55 +792,6 @@ end
 function sender:imbuementDurations(isOpen)
     local w = op(self, OP.ImbuementDurations)
     w:u8(boolByte(isOpen))
-    return self:_send(w)
-end
-
--- ---------------------------------------------------------------------------
--- exaltation forge  (Otc::ForgeAction_t, const.h:531-537)
--- ---------------------------------------------------------------------------
--- 0xBF: u8 actionType; ONLY when actionType is FUSION(0) or TRANSFER(1)
--- (protocolgamesend.cpp:1670-1684 sendForgeRequest) does the body grow: u8 convergence,
--- u16 firstItemId, u8 firstItemTier, u16 secondItemId, u8 improveChance, u8 tierLoss.
--- vBot's own forge waypoint (cavebot/route_tools.lua) only ever calls this with
--- DUST2SLIVER(2) or INCREASELIMIT(4), which take NO extra fields -- the trailing
--- parameters exist purely so a future FUSION/TRANSFER caller has the real signature.
-sender.FORGE_ACTION = { FUSION = 0, TRANSFER = 1, DUST2SLIVER = 2, SLIVER2CORE = 3,
-                        INCREASELIMIT = 4 }
-function sender:forgeRequest(actionType, convergence, firstItemId, firstItemTier,
-                             secondItemId, improveChance, tierLoss)
-    local at = u8arg(actionType)
-    local w = op(self, OP.ForgeEnter)
-    w:u8(at)
-    if at == sender.FORGE_ACTION.FUSION or at == sender.FORGE_ACTION.TRANSFER then
-        w:u8(boolByte(convergence))
-        w:u16(math.floor(firstItemId or 0))
-        w:u8(u8arg(firstItemTier))
-        w:u16(math.floor(secondItemId or 0))
-        w:u8(boolByte(improveChance))
-        w:u8(boolByte(tierLoss))
-    end
-    return self:_send(w)
-end
-
--- ---------------------------------------------------------------------------
--- supply stash  (Otc::Supply_Stash_Actions_t, const.h:889-895)
--- ---------------------------------------------------------------------------
--- 0x28 (shares ClientUseStash with sendStashWithdraw): u8 action, Position(5), u16
--- itemId, u8 stackpos, then a u32 count -- but ONLY when action is STOW_ITEM(0)
--- (protocolgamesend.cpp:1815-1828 sendStashStow).  depositor.lua's "stow all of this
--- item type" call always passes action=2 (STOW_STACK), which is why route_tools'/
--- depositor's own call sites pass count=0 -- it is never written to the wire for them.
-sender.STASH_ACTION = { STOW_ITEM = 0, STOW_CONTAINER = 1, STOW_STACK = 2, WITHDRAW = 3 }
-function sender:stashStowItem(pos, itemId, count, stackpos, action)
-    local act = u8arg(action)
-    local w = op(self, OP.UseStash)
-    w:u8(act)
-    writePos(w, pos)
-    w:u16(math.floor(itemId or 0))
-    w:u8(u8arg(stackpos))
-    if act == sender.STASH_ACTION.STOW_ITEM then
-        w:u32(math.floor(count or 0))
-    end
     return self:_send(w)
 end
 

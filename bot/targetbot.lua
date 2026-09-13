@@ -136,6 +136,7 @@ targetbot.LURE_MARGIN_MIN   = 5
 targetbot.LURE_MARGIN_MAX   = 6
 targetbot.PZ_STATE          = 16384  -- PlayerStates.Pz (src/client/const.h:295)
 targetbot.WALK_WATCHDOG_PAD = 400
+targetbot.QUICK_LOOT_SYNC_DELAYS = { 1000, 3000, 7000, 15000, 30000 }
 
 local HOTKEY_POS = { x = 0xFFFF, y = 0, z = 0 }
 
@@ -364,6 +365,7 @@ function targetbot.new(b, config, opts)
     self.loot = lootmod.new{
         client = client, world = self.world, path = self.path,
         storage = self.storage, clientVersion = self.clientVersion,
+        blacklist = b and b.characterBlacklist,
         now      = self._clock,
         schedule = function(ms, fn)
             if b and b.schedule then return b:schedule(ms, fn) end
@@ -443,12 +445,40 @@ function TB:reload(config)
         end
     end
     self.loot:update(looting)
+    -- Temple routes still run `!quickloot add,...` after login; those merge into
+    -- the server accepted list. Re-push the TargetBot whitelist once the route
+    -- has finished those commands so leftover food IDs cannot remain active.
+    self:scheduleQuickLootSync('targetbot reload')
 
     -- target.lua:150-151
     self.delayUntil  = 0
     self.lureEnabled = true
     if self.macro then self.macro.delay = nil end
     return self
+end
+
+--- Re-send the native whitelist after server-side Quick Loot state has had time to settle.
+--- A newer request supersedes older retry batches, which keeps route changes bounded.
+function TB:scheduleQuickLootSync(reason)
+    if not (self.bot and self.bot.schedule and self.loot
+            and self.loot.onlyConfiguredItems) then
+        return false
+    end
+    self._quickLootSyncGeneration = (self._quickLootSyncGeneration or 0) + 1
+    local generation = self._quickLootSyncGeneration
+    local delays = targetbot.QUICK_LOOT_SYNC_DELAYS
+    for i = 1, #delays do
+        local delay, attempt = delays[i], i
+        self.bot:schedule(delay, function()
+            if self._quickLootSyncGeneration ~= generation then return end
+            if self.loot and self.loot.onlyConfiguredItems then
+                self.log.debug('[TargetBot] quickloot whitelist retry %d/%d (%s)',
+                               attempt, #delays, tostring(reason or 'scheduled'))
+                self.loot:syncServerQuickLoot()
+            end
+        end)
+    end
+    return true
 end
 
 function TB:_loadNamed(name)
@@ -1108,6 +1138,15 @@ function TB:nearTiles(pos)
     return out
 end
 
+function TB:isTrapped(pos)
+    for i = 1, #NEAR_DIRS do
+        local d = NEAR_DIRS[i]
+        local tile = self.state:tile({ x = pos.x - d[1], y = pos.y - d[2], z = pos.z })
+        if tile and self.world:isWalkable(tile, false) then return false end
+    end
+    return true
+end
+
 local function tileHasCreatures(tile)
     local things = tile.things
     for i = 1, #things do
@@ -1178,12 +1217,7 @@ function TB:creatureWalk(c, cfg, targets)
     if not (pos and cpos) then return end
 
     -- (a) trapped test
-    local isTrapped = true
-    for i = 1, #NEAR_DIRS do
-        local d = NEAR_DIRS[i]
-        local tile = st:tile({ x = pos.x - d[1], y = pos.y - d[2], z = pos.z })
-        if tile and self.world:isWalkable(tile, false) then isTrapped = false end
-    end
+    local isTrapped = self:isTrapped(pos)
 
     -- (b) dynamic-lure latch.  VERIFIER: only the latch is inside the dynamicLure guard;
     -- the four fields onPlayerPositionChange reads are assigned UNCONDITIONALLY, and
@@ -1378,6 +1412,8 @@ function TB:tick()
     end
 
     local highestPriority, highestParams = 0, nil
+    local trapped = self:isTrapped(pos)
+    local trappedParams = nil
     local dangerLevel, targets = 0, 0
     for i = 1, #cands do
         local c = cands[i]
@@ -1395,9 +1431,20 @@ function TB:tick()
                         highestPriority = params.priority
                         highestParams   = params
                     end
+                    if trapped and cheb(pos, c.pos) <= 1
+                       and (not trappedParams or params.priority > trappedParams.priority) then
+                        trappedParams = params
+                    end
                 end
             end
         end
+    end
+
+    -- A surrounded player must clear a reachable adjacent monster before pursuing a
+    -- farther target.  This mirrors CaveBot's blocking-monster recovery for cases where
+    -- TargetBot is the module that owns the current combat decision.
+    if trappedParams and (not highestParams or cheb(pos, highestParams.creature.pos) > 1) then
+        highestParams = trappedParams
     end
 
     -- reset walking

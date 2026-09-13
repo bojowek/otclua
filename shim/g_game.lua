@@ -76,13 +76,7 @@ function M.new(LC, reg, opts)
     -- ------------------------------------------------------------------ state
     local attackingId, followingId = 0, 0
     local features   = {}
-    -- game.cpp:69-70's own construction defaults: m_fightMode = FightBalanced(unused by
-    -- this shim's own callers, which pass their own `mode`), m_chaseMode = DontChase,
-    -- m_pvpMode = WhiteDove(0), m_safeFight = true.  REVIEW FIX: this used to start
-    -- safeFight at `false`, so a ported vBot script calling g_game.isSafeFight() before
-    -- ever calling a setter itself (or before the first live 0xA7 PlayerModes update) got
-    -- the opposite of what the real client would report at the same point.
-    local fightMode, chaseMode, safeFight, pvpMode = 1, 0, true, 0
+    local fightMode, chaseMode, safeFight, pvpMode = 1, 0, false, 0
     local tileThingLuaCallback = false
     local unjustified = { killsDay = 0, killsDayRemaining = 0,
                           killsWeek = 0, killsWeekRemaining = 0,
@@ -143,10 +137,19 @@ function M.new(LC, reg, opts)
         return bus.off(handle)
     end
 
-    local posHandle
+    local posHandle, cancelHandle, waitHandle
     if LC.events and LC.events.on then
         posHandle = busOn(LC.events, 'positionChange', function(d)
             if d and d.pos then onConfirmedMove(d.pos) end
+        end)
+        cancelHandle = busOn(LC.events, 'walkCancel', function()
+            clearPreWalks()
+        end)
+        waitHandle = busOn(LC.events, 'walkWait', function(d)
+            local ms = d and tonumber(d.millis)
+            if not ms or ms <= 0 then return end
+            local player = reg:localPlayer()
+            if player and player.lockWalk then pcall(player.lockWalk, player, ms) end
         end)
     end
 
@@ -829,14 +832,9 @@ function M.new(LC, reg, opts)
         return s:imbuementDurations(isOpen and true or false)
     end
 
-    -- Otc::ForgeAction_t (const.h) -- proto/sender.lua:forgeRequest, opcode 0xBF
-    -- (work item R1 added the builder; this call site was missed at the time --
-    -- see docs/vbot/parity.md sec.4 / that work item's crossFileRequests).
-    function g.forgeRequest(actionType, convergence, firstItemId, firstItemTier,
-                             secondItemId, improveChance, tierLoss)
-        local s = sender(); if not canAct() or not s then return end
-        return s:forgeRequest(actionType, convergence, firstItemId, firstItemTier,
-                               secondItemId, improveChance, tierLoss)
+    function g.forgeRequest()
+        reg:report('g_game.forgeRequest', 'no forge sender (1 decorative call site)')
+        return nil
     end
 
     -- Render / map-view surface (blocker B4): callable, inert, never consulted for a
@@ -849,8 +847,12 @@ function M.new(LC, reg, opts)
 
     -- ------------------------------------------------------------------ teardown
     function g._shutdown()
-        if posHandle and LC.events and LC.events.off then busOff(LC.events, posHandle) end
-        posHandle = nil
+        if LC.events and LC.events.off then
+            for _, handle in pairs({ posHandle, cancelHandle, waitHandle }) do
+                if handle then busOff(LC.events, handle) end
+            end
+        end
+        posHandle, cancelHandle, waitHandle = nil, nil, nil
         if preWalkTimer and LC.sched then LC.sched.cancel(preWalkTimer) end
         preWalkTimer = nil
     end

@@ -178,6 +178,7 @@ function host.new(opts)
     h.config    = opts.config or 'vBot_4.8'
     h.profile   = tonumber(opts.profile) or 1
     h.readOnly  = opts.readOnly ~= false
+    h.writeAllow = opts.writeAllow or {}
     h.log       = opts.log or (opts.LC and opts.LC.log)
     h.mkWidget  = opts.mkWidget
     h.saveEvery = opts.saveEvery == nil and 60000 or tonumber(opts.saveEvery)
@@ -245,8 +246,15 @@ function H:_guardResources()
     if res._shimGuarded then return end
     local blocked = self.blockedWrites
     local log = self.log
-    local function refuse(what)
+    local function permitted(path)
+        if type(path) ~= 'string' then return false end
+        local ok, virtual = pcall(res.resolvePath, path)
+        if not ok or type(virtual) ~= 'string' then return false end
+        return self:_writeAllowed(virtual)
+    end
+    local function refuse(what, real)
         return function(path, ...)
+            if permitted(path) then return real(path, ...) end
             blocked[#blocked + 1] = what .. ' ' .. tostring(path)
             if log and log.debug then
                 log.debug('shim/host: read-only mode refused %s(%s)', what, tostring(path))
@@ -258,10 +266,10 @@ function H:_guardResources()
     res._realDelete = res.deleteFile
     res._realRemove = res.removeFile
     res._realMakeDir = res.makeDir
-    res.writeFileContents = refuse('writeFileContents')
-    res.deleteFile        = refuse('deleteFile')
-    res.removeFile        = refuse('removeFile')
-    res.makeDir           = refuse('makeDir')
+    res.writeFileContents = refuse('writeFileContents', res._realWrite)
+    res.deleteFile        = refuse('deleteFile', res._realDelete)
+    res.removeFile        = refuse('removeFile', res._realRemove)
+    res.makeDir           = refuse('makeDir', res._realMakeDir)
     res._shimGuarded = true
 end
 
@@ -312,8 +320,9 @@ end
 
 function H:saveStorage()
     if not self.context then return false, 'not started' end
-    if self.readOnly then
-        self.blockedWrites[#self.blockedWrites + 1] = 'saveStorage ' .. self:_storagePath()
+    local path = self:_storagePath()
+    if self.readOnly and not self:_writeAllowed(path) then
+        self.blockedWrites[#self.blockedWrites + 1] = 'saveStorage ' .. path
         return false, 'read-only'
     end
     local json = require('lib.json')
@@ -321,7 +330,14 @@ function H:saveStorage()
     if not ok then return false, txt end
     local res = self.res
     res.makeDir(('/bot/%s/storage'):format(self.config))
-    return res.writeFileContents(self:_storagePath(), txt) and true or false
+    return res.writeFileContents(path, txt) and true or false
+end
+
+function H:_writeAllowed(path)
+    for _, prefix in ipairs(self.writeAllow or {}) do
+        if path == prefix or path:sub(1, #prefix + 1) == prefix .. '/' then return true end
+    end
+    return false
 end
 
 -- ---------------------------------------------------------------------------
@@ -603,7 +619,8 @@ function H:tick()
         return false, terr
     end
 
-    if self.saveEvery and self.saveEvery > 0 and not self.readOnly then
+     if self.saveEvery and self.saveEvery > 0
+         and (not self.readOnly or self:_writeAllowed(self:_storagePath())) then
         local now = self:_millis()
         if now - (self._lastSave or 0) >= self.saveEvery then
             self._lastSave = now
@@ -638,7 +655,9 @@ end
 -- ---------------------------------------------------------------------------
 function H:stop()
     self:disarm()
-    if self.started and not self.readOnly then self:saveStorage() end
+    if self.started and (not self.readOnly or self:_writeAllowed(self:_storagePath())) then
+        self:saveStorage()
+    end
     self:_teardownHooks()
     self:_unguardResources()
     self.started = false

@@ -124,6 +124,7 @@ loot.WALK_MAX_DIST        = 20     -- looting.lua:169
 loot.MAX_CONTAINER_ID     = 15     -- Game::findEmptyContainerId scans the open-container map
 loot.INVENTORY_FIRST      = 1
 loot.INVENTORY_LAST       = 10
+loot.SERVER_AUTO_LOOT     = false  -- disabled; do not send repeated server Quick Loot requests
 
 -- ---------------------------------------------------------------------------
 -- helpers
@@ -151,6 +152,11 @@ local function inventoryPos(slot)
 end
 
 local function nolog() end
+
+local function itemIdInList(itemsById, id)
+    return itemsById and itemsById[id] == true
+end
+
 local function mklog(l)
     if type(l) ~= 'table' then
         return { info = nolog, warn = nolog, error = nolog, debug = nolog }
@@ -178,6 +184,7 @@ function loot.new(ctx)
     self.world   = ctx.world
     self.path    = ctx.path
     self.storage = ctx.storage or {}
+    self.blacklist = ctx.blacklist or {}
     -- REVIEW FIX: seed the extras WIDGET default (vBot/extras.lua:139 addCheckBox(
     -- "lootLast", ..., true)) exactly ONCE, so `L:lootLast` can read the key honestly
     -- instead of hiding a TRUE default behind `~= false`.
@@ -255,6 +262,11 @@ function L:update(data)
     self.data       = data
     self.items      = type(data.items)      == 'table' and data.items      or {}
     self.containers = type(data.containers) == 'table' and data.containers or {}
+    self.onlyConfiguredItems = data.onlyConfiguredItems ~= false
+    -- Tibia 15 defaults to all-item looting; an item list without an explicit mode is a whitelist.
+    if data.everyItem == nil then
+        data.everyItem = #self.items == 0
+    end
     self.itemsById, self.containersById = {}, {}
     for _, e in ipairs(self.items) do
         local id = type(e) == 'table' and e.id or e
@@ -265,7 +277,48 @@ function L:update(data)
         if type(id) == 'number' then self.containersById[id] = true end
     end
     self.lootTries = {}
+    if not loot.SERVER_AUTO_LOOT then self:syncServerQuickLoot() end
     return self
+end
+
+--- Unique configured loot IDs, excluding the character blacklist.
+function L:configuredItemIds()
+    local out, seen = {}, {}
+    for _, e in ipairs(self.items or {}) do
+        local id = type(e) == 'table' and e.id or e
+        id = tonumber(id)
+        if id and id >= 1 and not seen[id] and not self:isBlacklisted(id) then
+            seen[id] = true
+            out[#out + 1] = math.floor(id)
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+--- Push the TargetBot item list to the server as native Quick Loot accept-only.
+--- `0x91` filter=1 replaces the accepted list and selects whitelist mode, so
+--- leftover food IDs (meat 3577, ham 3582) stop being auto-looted.
+function L:syncServerQuickLoot()
+    if loot.SERVER_AUTO_LOOT then
+        return nil, 'server auto-loot mode'
+    end
+    local s = self.sender
+    if not (s and type(s.quickLootBlackWhitelist) == 'function') then
+        return nil, 'no sender'
+    end
+    if not self.onlyConfiguredItems then
+        return nil, 'not onlyConfiguredItems'
+    end
+    local ids = self:configuredItemIds()
+    local body, err = s:quickLootBlackWhitelist(1, ids)
+    if body then
+        self.log.debug('[Loot] server quickloot whitelist: filter=1 count=%d ids=%s',
+                      #ids, table.concat(ids, ','))
+    else
+        self.log.error('[Loot] server quickloot sync failed: %s', tostring(err))
+    end
+    return body, err
 end
 
 --- TargetBot.Looting.save(data) (looting.lua:77-83) -- writes the five behaviour-bearing
@@ -275,6 +328,9 @@ function L:save(data)
     data = data or {}
     data.items       = self.items
     data.containers  = self.containers
+    if self.onlyConfiguredItems or data.onlyConfiguredItems ~= nil then
+        data.onlyConfiguredItems = self.onlyConfiguredItems
+    end
     data.everyItem   = self:everyItem()
     data.maxDanger   = self:maxDanger()
     data.minCapacity = self:minCapacity()
@@ -312,6 +368,10 @@ function L:lootDelay() return tonumber(self:extras().lootDelay) or loot.DEFAULT_
 function L:foodItems()
     local f = self.storage and self.storage.foodItems
     return type(f) == 'table' and f or nil
+end
+
+function L:isBlacklisted(itemId)
+    return self.blacklist[itemId] == true
 end
 
 function L:getStatus() return self.status end
@@ -436,11 +496,6 @@ function L:onCreatureDisappear(c, posHint)
     if not self._isOn() then return end
     if not c.isMonster then return end
 
-    -- NOTE the EMPTY path: `#path == 0` always passes the maxDistance gate, so only
-    -- "has a matching config" and `dontLoot` decide here (looting.lua:314).
-    local params = self._params(c, {})
-    if not params or not params.config or params.config.dontLoot then return end
-
     local pl = self.state.player
     local ppos = pl and pl.pos
     local mpos = c.pos or posHint
@@ -455,7 +510,6 @@ function L:onCreatureDisappear(c, posHint)
 end
 
 function L:_discover(mpos, name)
-    if not self.containers[1] then return end                 -- no loot bag configured
     if self.list[loot.QUEUE_CAP] then return end              -- queue cap: 20 entries
     local tile = self.state:tile(mpos)
     if not tile then return end
@@ -522,12 +576,58 @@ end
 -- ---------------------------------------------------------------------------
 -- 4.3 the per-tick state machine
 -- ---------------------------------------------------------------------------
+function L:processServerAutoLoot()
+    local entry = self:current()
+    if entry == nil then
+        self.status = ''
+        return false
+    end
+
+    local now = self:now()
+    if self.waitTill > now then return true end
+
+    local pl = self.state.player
+    local pos = pl and pl.pos
+    if not pos then return true end
+    local dist = cheb(pos, entry.pos)
+    if entry.tries > loot.MAX_WALK_TRIES
+        or entry.pos.z ~= pos.z
+        or dist > loot.DEFAULT_MAX_RANGE then
+        self:pop()
+        return true
+    end
+
+    self.status = 'Looting'
+    if dist > loot.MIN_DIST then
+        entry.tries = entry.tries + 1
+        self._walkTo(entry.pos, loot.WALK_MAX_DIST,
+                     { ignoreNonPathable = true, precision = loot.WALK_PRECISION })
+        return true
+    end
+
+    local body, err = self.sender:sendQuickLoot(2, entry.pos)
+    if not body then
+        entry.tries = entry.tries + 1
+        self.log.error('[Loot] server auto-loot request failed: %s', tostring(err))
+        self.waitTill = now + loot.DEFAULT_LOOT_DELAY
+        return true
+    end
+    self.stats.quickLoot = (self.stats.quickLoot or 0) + 1
+    self:pop()
+    self.waitTill = now + loot.DEFAULT_LOOT_DELAY
+    return true
+end
+
 function L:process(targets, dangerLevel)
+    if loot.SERVER_AUTO_LOOT then return self:processServerAutoLoot() end
     dangerLevel = dangerLevel or 0
 
     -- 1
     local everyItem = self:everyItem()
-    if (not self.items[1] and not everyItem) or not self.containers[1] then
+    local hasDestinationConfig = next(self.containersById) ~= nil
+    if (self.onlyConfiguredItems and not self.items[1])
+        or (not self.onlyConfiguredItems and not self.items[1] and not everyItem)
+        or (hasDestinationConfig and not self.containers[1]) then
         self.status = ''
         return false
     end
@@ -606,13 +706,15 @@ end
 function L:getLootContainers()
     local out, openedById, toOpen = {}, {}, nil
     local byId = self.containersById
+    local useAnyOpenContainer = next(byId) == nil
     local open = self:openContainersSorted()
 
     for i = 1, #open do
         local ct = open[i]
         local fromId = self:containerItemId(ct)
         if fromId ~= nil then openedById[fromId] = 1 end
-        if fromId ~= nil and byId[fromId] and not self.isLootContainer[ct.id] then
+        if (useAnyOpenContainer or (fromId ~= nil and byId[fromId]))
+           and not self.isLootContainer[ct.id] then
             local items = ct.items or {}
             if #items < (ct.capacity or 0) or ct.hasPages then
                 out[#out + 1] = ct                                   -- has room
@@ -675,6 +777,7 @@ function L:lootContainer(lootContainers, ct)
     local everyItem = self:everyItem()
     local byId      = self.itemsById
     local items     = ct.items or {}
+    local strictList = self.onlyConfiguredItems or (not everyItem and self.items[1] ~= nil)
     -- REVIEW FIX: vBot keys lootTries on the Item OBJECT (looting.lua:241-246), so every
     -- distinct item starts at 0.  Our "<containerId>:<slot>:<itemId>" key collapses N
     -- identical ids onto ONE counter, because removing an item shifts the remaining slots
@@ -693,10 +796,14 @@ function L:lootContainer(lootContainers, ct)
     for slot = 1, #items do
         local it = items[slot]
         local isCt = it.id ~= nil and self.isContainerItem(it.id) or false
-        if isCt and not byId[it.id] then
+        if self:isBlacklisted(it.id) then
+            -- Character blacklist entries suppress item pickup without changing the
+            -- TargetBot profile's whitelist or destination-container selection.
+        elseif isCt and not byId[it.id] then
             nextContainer, nextSlot = it, slot                 -- keeps the LAST such slot
-        elseif (not everyItem and byId[it.id])
-            or (everyItem and not isCt and not byId[it.id]) then
+        elseif (self.onlyConfiguredItems and itemIdInList(byId, it.id))
+            or (not self.onlyConfiguredItems and not everyItem and itemIdInList(byId, it.id))
+            or (not self.onlyConfiguredItems and everyItem and not isCt and not byId[it.id]) then
             local key = ct.id .. ':' .. slot .. ':' .. tostring(it.id)
             local n = (self.lootTries[key] or 0) + 1
             self.lootTries[key] = n
@@ -704,7 +811,7 @@ function L:lootContainer(lootContainers, ct)
                 return self:lootItem(lootContainers, ct, slot, it)
             end
             self.stats.abandoned = self.stats.abandoned + 1
-        elseif food and food[1] and self.lastFood + loot.FOOD_INTERVAL_MS < now then
+        elseif not strictList and food and food[1] and self.lastFood + loot.FOOD_INTERVAL_MS < now then
             for _, f in ipairs(food) do
                 if it.id == f.id then
                     if self.sender then

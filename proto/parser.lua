@@ -138,7 +138,7 @@ local F_TACTICS_NO_FIGHT_MODE    = 136
 
 -- docs/opcode-map.md §1 "ON at 1530", minus the six explicit disables.
 local FEATURES_ON_1530 = {
-  22,122,125, 79,78, 42,45,63, 44,43,47,46,48,49, 51,
+  22,122,125, 79,78, 42,45,63, 44,43,47,46,48,49, 51,5,
   1,2,6, 3,61,124, 14, 32, 4, 7,12,23, 5,8,9,10,11,
   17,21,24, 18,20, 52, 98, 62,64, 35,36, 40,58, 41,50,
   29,53, 54,55, 57, 59, 68, 66, 70, 71, 60, 65, 67, 69,
@@ -258,6 +258,9 @@ function parser.new(state, emit)
 
   self.history = {}          -- last opcodes handled (most recent last)
   self.opcodeCount = 0
+  -- OTClient keeps known Creature objects after they leave the map. A later known-creature
+  -- map update therefore has no name on the wire but still resolves to the cached object.
+  self.creatureCache = {}
   self.central = nil         -- Map::m_centralPosition
   self.pendingGame = false
   self.ingame = false
@@ -625,6 +628,7 @@ end
 function P:applyCreature(c)
   local st = self.state
   local isNew = (self:creature(c.id) == nil)
+  local existing = self:creature(c.id)
   local rec = { id = c.id }
   if c.turnOnly then
     rec.direction = c.direction
@@ -637,7 +641,13 @@ function P:applyCreature(c)
     rec.light         = { intensity = c.lightIntensity, color = c.lightColor }
     rec.speed         = c.speed
     rec.type          = c.type
-    local existing = self:creature(c.id)
+    if c.name and c.name ~= '' then
+      self.creatureCache[c.id] = { name = c.name }
+    elseif self.creatureCache[c.id] then
+      rec.name = self.creatureCache[c.id].name
+    elseif existing and existing.name then
+      rec.name = existing.name
+    end
     rec.icons = c.icons
     if c.icons2 then rec.icons = mergeIcons(rec.icons or (existing and existing.icons), c.icons2) end
     rec.skull  = c.skull
@@ -665,6 +675,7 @@ function P:applyCreature(c)
   -- 0x61 UnknownCreature carries the id the server wants evicted from the cache
   if c.removeId and c.removeId ~= 0 and c.removeId ~= c.id then
     self:dropCreature(c.removeId)
+    self.creatureCache[c.removeId] = nil
   end
   if isNew then self.emit('creatureAppear', cr) end
   -- A TURN is its own packet shape at 1530: the `Proto::Creature` marker
@@ -983,14 +994,8 @@ S[0x29] = function(self, R)                       -- SupplyStash
   self.state.supplyStash = items
 end
 
--- protocolgameparse.cpp:5542-5548 (parseSpecialContainer): u8 supplyStashAvailable ->
--- LocalPlayer::setSupplyStashAvailable, then (>=1220 only) a u8 isMarketAvailable that
--- the real client also throws away (never stored anywhere).  Stored on state.player so a
--- shim/bot query (`player:isSupplyStashAvailable()`) can answer truthfully instead of a
--- hardcoded false -- was previously read and discarded here.
 S[0x2A] = function(self, R)                       -- SpecialContainer
-  local avail = R:u8()
-  self:player().supplyStashAvailable = (avail ~= 0)
+  R:u8()                                          -- supplyStashAvailable
   if self.protocolVersion >= 1220 then R:u8() end -- isMarketAvailable
 end
 
@@ -1585,7 +1590,8 @@ S[0x7A] = function(self, R)                       -- OpenNpcTrade
   -- The offer list is what bot/cavebot.lua's `buysupplies` / `sellall` waypoints need
   -- to know what this NPC actually trades, so it is KEPT on the state (it used to be
   -- parsed and discarded).  Cleared by 0x7C CloseNpcTrade.
-  if self:feat(F_NAME_ON_NPC_TRADE) then R:string() end
+  local npcName
+  if self:feat(F_NAME_ON_NPC_TRADE) then npcName = R:string() end
   if self.clientVersion >= 1281 then R:u16(); R:string() end
   local n = (self.clientVersion >= 900) and R:u16() or R:u8()
   local list = {}
@@ -1595,7 +1601,7 @@ S[0x7A] = function(self, R)                       -- OpenNpcTrade
     list[#list + 1] = { id = id, subType = sub, name = name,
                         weight = weight, buyPrice = buy, sellPrice = sell }
   end
-  self.state.npcTrade = { open = true, items = list }
+  self.state.npcTrade = { open = true, npcName = npcName, items = list }
   self.emit('npcTrade', self.state.npcTrade)
 end
 
@@ -1604,10 +1610,17 @@ S[0x7B] = function(self, R)                       -- PlayerGoods
     if self:feat(98) then R:u64() else R:u32() end
   end
   local n = (self.clientVersion >= 1334) and R:u16() or R:u8()
+  local goods = {}
   for _ = 1, n do
-    R:u16()
-    if self:feat(F_DOUBLE_SHOP_SELL_AMOUNT) then R:u16() else R:u8() end
+    local id = R:u16()
+    local count = self:feat(F_DOUBLE_SHOP_SELL_AMOUNT) and R:u16() or R:u8()
+    goods[id] = (goods[id] or 0) + count
   end
+  if type(self.state.npcTrade) ~= 'table' then
+    self.state.npcTrade = { open = false, items = {} }
+  end
+  self.state.npcTrade.playerGoods = goods
+  self.emit('playerGoods', goods)
 end
 
 S[0x7C] = function(self, R)                       -- CloseNpcTrade (empty payload)
@@ -1739,23 +1752,6 @@ S[0x8A] = function(self, R)                       -- ForgeResult
 end
 
 -- --- creatures -------------------------------------------------------------
--- CreatureData sub-type 11/12/13: protocolgameparse.cpp:2434-2456's parseCreatureData
--- switches on the type byte, but cases 11 ("creature mana percent"), 12 ("creature show
--- status") and 13 ("player vocation") all fall through to the SAME call --
--- setCreatureVocation(msg, creatureId) (:2346-2355), which reads exactly ONE u8 and does
--- nothing but `creature->setVocation(vocationId)`.  Creature::setManaPercent exists
--- (creature.h:61, m_manaPercent defaults to 101) but is bound to Lua only -- there is no
--- C++ call site for it anywhere in the parse path, confirmed by an exhaustive grep of
--- src/client/*.cpp.  So at 1530 there is no genuine, separate "party mana" or "show
--- status" byte on the wire: whatever a type-11/12 packet carries just overwrites the same
--- vocation field a type-13 packet would, and inventing a distinct manaPercent/showStatus
--- field here would be storing a value this wire never actually carries.  (The real vBot
--- "party mana" feature vBot scripts read via `creature:setManaPercent(...)` comes from an
--- entirely different source -- the user's own self-hosted BotServer relay,
--- mods/game_bot/default_configs/vBot_4.8/vBot/BotServer.lua:145 -- a Lua-level socket
--- broadcast between the user's own bot instances, already a stated non-goal for luaclient:
--- docs/vbot/parity.md §3 "isFriend / BotServer roster".)  All three types therefore write
--- the one real field: a per-remote-creature vocation, which IS on the wire (G6).
 S[0x8B] = function(self, R)                       -- CreatureData
   local id = R:u32()
   local t  = R:u8()
@@ -1764,7 +1760,11 @@ S[0x8B] = function(self, R)                       -- CreatureData
   elseif t == 11 or t == 12 or t == 13 then
     local v = R:u8()
     local c = self:creature(id)
-    if c then c.vocation = v end                  -- all three sub-types share this field
+    if c then
+      if t == 11 then c.manaPercent = v
+      elseif t == 12 then c.showStatus = v
+      else c.vocation = v end
+    end
   elseif t == 14 then
     local icons = self:readIconList(R)
     local c = self:creature(id)
@@ -2735,7 +2735,12 @@ S[0xDD] = function(self, R)                       -- AutomapFlag
   self.emit('automapFlag', { pos = p, icon = icon, description = desc })
 end
 
-S[0xDE] = function(self, R) R:u8() end            -- DailyRewardCollectionState
+S[0xDE] = function(self, R)                       -- DailyRewardCollectionState
+  local collectionState = R:u8()
+  self.state.dailyReward = self.state.dailyReward or { history = {} }
+  self.state.dailyReward.collectionState = collectionState
+  self.emit('dailyRewardCollectionState', { state = collectionState })
+end
 
 S[0xDF] = function(self, R)                       -- CoinBalance
   if R:u8() ~= 0 then
@@ -2754,44 +2759,85 @@ end
 S[0xE1] = function(self, R) R:u32(); R:u8() end   -- RequestPurchaseData
 
 S[0xE2] = function(self, R)                       -- SendOpenRewardWall (gunz layout)
-  R:u8(); R:u32(); R:u8()
-  local wasTaken = R:u8()
-  if wasTaken ~= 0 then
-    R:string()
+  local wall = {
+    bonusShrine = R:u8(),
+    nextRewardTime = R:u32(),
+    dayStreakDay = R:u8(),
+  }
+  wall.wasDailyRewardTaken = R:u8()
+  if wall.wasDailyRewardTaken ~= 0 then
+    wall.errorMessage = R:string()
     local token = R:u8()
-    if (not self.isGunzOs) and token ~= 0 then R:u16() end
+    wall.tokens = 0
+    if (not self.isGunzOs) and token ~= 0 then wall.tokens = R:u16() end
+    wall.timeLeft = 0
   else
     local flag = R:u8()
-    if (not self.isGunzOs) or flag ~= 1 then R:u32() end
-    R:u16()
+    wall.errorMessage = ''
+    if (not self.isGunzOs) or flag ~= 1 then wall.timeLeft = R:u32() else wall.timeLeft = 0 end
+    wall.tokens = R:u16()
   end
-  R:u16()                                         -- dayStreakLevel
+  wall.dayStreakLevel = R:u16()
+  self.state.dailyReward = self.state.dailyReward or { history = {} }
+  self.state.dailyReward.wall = wall
+  self.emit('rewardWall', wall)
 end
 
 local function readRewardDay(R)
-  local mode = R:u8()
+  local day = { redeemMode = R:u8(), itemsToSelect = 0,
+                selectableItems = {}, bundleItems = {} }
+  local mode = day.redeemMode
   if mode == 1 then
-    R:u8()                                        -- itemsToSelect
-    for _ = 1, R:u8() do R:u16(); R:string(); R:u32() end
+    day.itemsToSelect = R:u8()
+    for i = 1, R:u8() do
+      day.selectableItems[i] = { itemId = R:u16(), name = R:string(), weight = R:u32() }
+    end
   elseif mode == 2 then
-    for _ = 1, R:u8() do
+    for i = 1, R:u8() do
       local bundleType = R:u8()
-      if bundleType == 1 then R:u16(); R:string(); R:u8()
-      elseif bundleType == 2 then R:u8()
-      elseif bundleType == 3 then R:u16() end
+      local bundle = { bundleType = bundleType, itemId = 0, name = '', count = 0 }
+      if bundleType == 1 then
+        bundle.itemId = R:u16(); bundle.name = R:string(); bundle.count = R:u8()
+      elseif bundleType == 2 then
+        bundle.name = 'Prey Wildcards'; bundle.count = R:u8()
+      elseif bundleType == 3 then
+        bundle.itemId = R:u16(); bundle.name = 'XP Boost'
+      end
+      day.bundleItems[i] = bundle
     end
   end
+  return day
 end
 
 S[0xE4] = function(self, R)                       -- SendDailyReward
   local days = R:u8()
-  for _ = 1, days do readRewardDay(R); readRewardDay(R) end
-  for _ = 1, R:u8() do R:string(); R:u8() end     -- bonuses
-  R:u8()                                          -- maxUnlockableDragons
+  local data = { days = days, freeRewards = {}, premiumRewards = {}, bonuses = {} }
+  for i = 1, days do
+    data.freeRewards[i] = readRewardDay(R)
+    data.premiumRewards[i] = readRewardDay(R)
+  end
+  for i = 1, R:u8() do
+    data.bonuses[i] = { name = R:string(), id = R:u8() }
+  end
+  data.maxUnlockableDragons = R:u8()
+  self.state.dailyReward = self.state.dailyReward or { history = {} }
+  self.state.dailyReward.data = data
+  self.emit('dailyReward', data)
 end
 
 S[0xE5] = function(self, R)                       -- SendRewardHistory
-  for _ = 1, R:u8() do R:u32(); R:u8(); R:string(); R:u16() end
+  local history = {}
+  for i = 1, R:u8() do
+    history[i] = {
+      timestamp = R:u32(),
+      isPremium = R:u8() ~= 0,
+      description = R:string(),
+      dayStreak = R:u16(),
+    }
+  end
+  self.state.dailyReward = self.state.dailyReward or { history = {} }
+  self.state.dailyReward.history = history
+  self.emit('rewardHistory', history)
 end
 
 S[0xE6] = function(self, R)                       -- BosstiaryEntryChanged (GameBosstiary ON)
@@ -3017,12 +3063,16 @@ function P:readMarketItemTier(R, itemId)
 end
 
 S[0xF6] = function(self, R)                       -- MarketEnter
+  local market = { entered = true, items = {} }
   R:u8()                                          -- offers
   for _ = 1, R:u16() do
     local id = R:u16()
-    self:readMarketItemTier(R, id)
-    R:u16()                                       -- count
+    local tier = self:readMarketItemTier(R, id)
+    local count = R:u16()
+    market.items[#market.items + 1] = { itemId = id, tier = tier, count = count }
   end
+  self.state.market = market
+  self.emit('marketEnter', market)
 end
 
 S[0xF8] = function(self, R)                       -- MarketDetail
@@ -3057,20 +3107,30 @@ S[0xF9] = function(self, R)                       -- MarketBrowse
   end
   local ownOffers  = (var == 0xFFFE or var == 2)
   local ownHistory = (var == 0xFFFF or var == 1)
-  local function offer()
-    R:u32(); R:u16()                              -- timestamp, counter
+  local offers = {}
+  local function offer(action)
+    local timestamp, counter = R:u32(), R:u16()
+    local itemId, tier
     if ownOffers or ownHistory then
-      local id = R:u16()
-      self:readMarketItemTier(R, id)
+      itemId = R:u16()
+      tier = self:readMarketItemTier(R, itemId)
     end
-    R:u16()                                       -- amount
-    if self.clientVersion >= 1281 then R:u64() else R:u32() end
-    if ownHistory then R:u8()
-    elseif ownOffers then -- nothing
-    else R:string() end
+    local amount = R:u16()
+    local price = self.clientVersion >= 1281 and R:u64() or R:u32()
+    local holder, offerState = nil, 0
+    if ownHistory then offerState = R:u8()
+    elseif not ownOffers then holder = R:string() end
+    offers[#offers + 1] = { action = action, amount = amount, counter = counter,
+                            itemId = itemId or var, holder = holder, price = price,
+                            state = offerState, timestamp = timestamp, tier = tier or 0 }
   end
-  for _ = 1, R:u32() do offer() end               -- buy offers
-  for _ = 1, R:u32() do offer() end               -- sell offers
+  for _ = 1, R:u32() do offer(0) end               -- buy offers
+  for _ = 1, R:u32() do offer(1) end               -- sell offers
+  local browse = { itemId = var, offers = offers, ownOffers = ownOffers,
+                   ownHistory = ownHistory }
+  self.state.market = self.state.market or {}
+  self.state.market.browse = browse
+  self.emit('marketBrowse', browse)
 end
 
 -- --- modal dialog ----------------------------------------------------------

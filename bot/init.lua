@@ -136,6 +136,8 @@ end
 ---   client              _G.LC (log, sched, state, sender, events, items)
 ---   opts.profileDir     the vBot config directory (…/profiles/bot/vBot_4.8)
 ---   opts.vprofile       1..10, selects vBot_configs/profile_<N> and storage/profile_<N>.json
+---   opts.characterId    persistent server character id for characterdata storage
+---   opts.characterName login character name, retained as metadata
 ---   opts.cavebot        cavebot_configs base name to preselect
 ---   opts.targetbot      targetbot_configs base name to preselect
 ---   opts.autostart      start() immediately
@@ -183,7 +185,11 @@ function bot.new(client, opts)
 
     -- config store + storage --------------------------------------------------
     self.config = config.new{ profileDir = self.profileDir, vprofile = self.vprofile,
+                              characterName = opts.characterName,
                               log = client.log }
+    self.characterData = { blacklist = {} }
+    self.characterBlacklist = {}
+    self:setCharacterIdentity(opts.characterId, opts.characterName)
     local st, err = self.config:loadStorage()
     if st == nil then
         -- bot.lua:275-281: a corrupt storage file aborts bot startup.  We keep the
@@ -542,6 +548,55 @@ function Bot:saveStorage()
     return true
 end
 
+function Bot:isBlacklisted(itemId)
+    return self.characterBlacklist and self.characterBlacklist[itemId] == true
+end
+
+function Bot:setCharacterIdentity(characterId, characterName)
+    characterId = tonumber(characterId)
+    if not characterId or characterId < 1 then return false end
+    characterId = math.floor(characterId)
+    if self.config.characterId == characterId then
+        self.config.characterName = characterName or self.config.characterName
+        return true
+    end
+    self.config.characterId = characterId
+    self.config.characterName = characterName or self.config.characterName
+    self.characterData = self.config:loadCharacterData() or { blacklist = {} }
+    if type(self.characterData.blacklist) ~= 'table' then
+        self.characterData.blacklist = {}
+    end
+    for id in pairs(self.characterBlacklist) do self.characterBlacklist[id] = nil end
+    for _, id in ipairs(self.characterData.blacklist) do
+        if type(id) == 'number' then self.characterBlacklist[id] = true end
+    end
+    return true
+end
+
+function Bot:setCharacterBlacklist(items)
+    local list, seen = {}, {}
+    for _, id in ipairs(items or {}) do
+        id = tonumber(id)
+        if id and id >= 1 and not seen[id] then
+            seen[id] = true
+            list[#list + 1] = math.floor(id)
+        end
+    end
+    table.sort(list)
+    self.characterData.blacklist = list
+    for id in pairs(self.characterBlacklist) do self.characterBlacklist[id] = nil end
+    for id in pairs(seen) do self.characterBlacklist[id] = true end
+    local tb = self.modules and self.modules.targetbot
+    if tb and tb.loot and tb.loot.syncServerQuickLoot then
+        tb.loot:syncServerQuickLoot()
+        if tb.scheduleQuickLootSync then
+            tb:scheduleQuickLootSync('character blacklist changed')
+        end
+    end
+    if self.opts and self.opts.readOnlyProfile then return false, 'read-only profile' end
+    return self.config:saveCharacterData('blacklist.json', self.characterData)
+end
+
 --- REVIEW FIX: mutate the EXISTING table instead of replacing it.  bot/api.lua's sandbox
 --- `storage`, bot/targetbot.lua and bot/loot.lua all capture `bot.storage` by reference;
 --- swapping the table left them writing to an orphan that saveStorage() never persists.
@@ -656,7 +711,6 @@ function Bot:status()
         } or nil,
         healbot   = modStatus(self.modules.healbot),
         attackbot = modStatus(self.modules.attackbot),
-        stances   = modStatus(self.modules.stances),
         cavebot   = modStatus(self.modules.cavebot),
         targetbot = modStatus(self.modules.targetbot),
         macros    = {},
@@ -758,14 +812,6 @@ function Bot:wireModules(opts)
     build('attackbot', 'bot.attackbot', function(m)
         return m.new(self, nil, mergedOpts(opts.attackbotOpts))
     end)
-    -- work item N1: the fifth module.  Registers its own 200 ms macro in its
-    -- constructor, like healbot/attackbot (always-allowed, never yields) --
-    -- see bot/stances.lua's header.  Built here, after healbot/attackbot and
-    -- before targetbot/cavebot, which sets its place in the macro list BOT.md's
-    -- "As built" macro table documents.
-    build('stances', 'bot.stances', function(m)
-        return m.new(self, nil, mergedOpts(opts.stancesOpts))
-    end)
     local tb = build('targetbot', 'bot.targetbot', function(m)
         return m.new(self, opts.targetbot, mergedOpts(opts.targetbotOpts))
     end)
@@ -777,6 +823,9 @@ function Bot:wireModules(opts)
     -- macro registration order: targetbot then cavebot, after healbot/attackbot's ctors
     if tb and tb.attach then pcall(tb.attach, tb) end
     if cb and cb.attach then pcall(cb.attach, cb) end
+    build('money', 'bot.money', function(m)
+        return m.new(self, mergedOpts(opts.moneyOpts))
+    end)
 
     if tb and opts.enableTargetbot ~= nil then
         if opts.enableTargetbot then tb:setOn() else tb:setOff() end
@@ -786,9 +835,57 @@ function Bot:wireModules(opts)
     end
 
     self:info('modules wired: %s (world %s)',
-              table.concat({ 'healbot', 'attackbot', 'stances', 'targetbot', 'cavebot' }, ', '),
+              table.concat({ 'healbot', 'attackbot', 'targetbot', 'cavebot' }, ', '),
               tostring(self.world and self.world.itemDataLevel))
     return self.modules
+end
+
+-- Load user scripts from the native bot profile after the built-in modules exist.
+-- The profile's _Loader.lua belongs to the separate vBot compatibility path.
+function Bot:loadProfileScripts()
+    self.profileScripts = { loaded = {}, failed = {} }
+    if not self.profileDir then return self.profileScripts end
+
+    local env = setmetatable({}, {
+        __index = function(_, name)
+            local value = self.api[name]
+            if value ~= nil then return value end
+            return _G[name]
+        end,
+    })
+
+    for _, name in ipairs(config.listDir(self.profileDir)) do
+        if name:lower():sub(-4) == '.lua' and name:lower() ~= '_loader.lua' then
+            local path = config.join(self.profileDir, name)
+            if config.fileExists(path) then
+                local source, readErr = config.readFile(path)
+                local ok, err
+                if not source then
+                    err = readErr
+                else
+                    local chunk, compileErr = loadstring(source, '@' .. path)
+                    if not chunk then
+                        err = compileErr
+                    else
+                        setfenv(chunk, env)
+                        ok, err = pcall(chunk)
+                    end
+                end
+
+                if ok then
+                    self.profileScripts.loaded[#self.profileScripts.loaded + 1] = name
+                    self:info('profile script loaded: %s', name)
+                else
+                    self.profileScripts.failed[#self.profileScripts.failed + 1] = {
+                        name = name, error = tostring(err),
+                    }
+                    self:warn('profile script %s failed: %s', name, tostring(err))
+                end
+            end
+        end
+    end
+
+    return self.profileScripts
 end
 
 --- Drop the shared walker's event hooks.  Called from stop(); safe to call twice.

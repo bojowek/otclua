@@ -542,6 +542,22 @@ end
 -- ---------------------------------------------------------------------------
 local FLOOR_CHANGE_LENSHELP = { [1104] = true, [1105] = true }  -- stairs up / stairs down only
 world.FLOOR_CHANGE_LENSHELP = FLOOR_CHANGE_LENSHELP
+-- counterparts can still carry the same lens-help value, so they must not be
+-- treated as stairs when a path crosses an already-open door.
+local DOOR_IDS = {
+    [5007] = true, [8265] = true, [1629] = true, [1632] = true, [5129] = true,
+    [6252] = true, [6249] = true, [7712] = true, [7714] = true, [7715] = true,
+    [7719] = true, [6256] = true, [1669] = true, [1672] = true, [5125] = true,
+    [5115] = true, [5124] = true, [17701] = true, [17710] = true, [1642] = true,
+    [6260] = true, [5107] = true, [4912] = true, [6251] = true, [5291] = true,
+    [1683] = true, [1696] = true, [1692] = true, [5006] = true, [2179] = true,
+    [5116] = true, [11705] = true, [30772] = true, [30774] = true, [6248] = true,
+    [5735] = true, [5732] = true, [5120] = true, [23873] = true, [5736] = true,
+    [6264] = true, [5122] = true, [30049] = true, [30042] = true, [7727] = true,
+    -- Open counterparts observed in the 1530 item table and live route.
+    [6253] = true, [6255] = true, [6257] = true, [7716] = true,
+}
+world.DOOR_IDS = DOOR_IDS
 -- 1100 ladders, 1101 sewer grates, 1102 rope spots, 1106 shovel spots are DELIBERATELY
 -- excluded (walking.lua:96-100): standing on them is harmless, they need a use().
 
@@ -583,8 +599,9 @@ function world:isFloorChangeTile(pos, avoidIds)
             return true, 'floor-change ground id ' .. tostring(g.id)
         end
 
-        local top = self:getTopUseThing(tile)
-        if top and top ~= g and top.kind == 'item' and self:itemChangesFloor(top.id, false) then
+          local top = self:getTopUseThing(tile)
+          if top and top ~= g and top.kind == 'item' and not DOOR_IDS[top.id]
+              and self:itemChangesFloor(top.id, false) then
             return true, 'floor-change item id ' .. tostring(top.id)
         end
 

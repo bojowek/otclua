@@ -74,6 +74,7 @@ CB.__index = CB
 -- ---------------------------------------------------------------------------
 cavebot.TICK_MS            = 50      -- cavebot.lua:80 declares 20; macro() floors it to 50
 cavebot.ANTILOST_TICK_MS   = 200     -- antilost.lua:589
+cavebot.NPC_TALK_RANGE     = 3       -- stay adjacent so nearby NPCs do not also answer "hi"
 
 -- cavebot/config.lua:26-59 + the three appended by walking.lua:31-37
 cavebot.CONFIG_DEFAULTS = {
@@ -127,7 +128,6 @@ cavebot.LOCKER_OFFSETS = { [3497] = { 0, -1 }, [3498] = { 1, 0 },
 cavebot.DEPOT_CHEST_ID = 3502
 cavebot.INBOX_ID       = 12902
 cavebot.ROPE_FALLBACK  = 3003        -- antilost.lua rope-tool fallback below id 100
-cavebot.IMBUING_SHRINES = { 25060, 25061, 25182, 25183 }   -- imbuing.lua SHRINES
 
 -- ---------------------------------------------------------------------------
 -- small helpers
@@ -247,6 +247,12 @@ function cavebot.new(bot, route, opts)
 
     -- per-action scratch (all vBot file-locals)
     self.noProgress   = 0         -- buy_supplies.lua
+    self._buySuppliesFailed = false
+    self._buySuppliesCapacityFailed = false
+    self._buySuppliesNpc = nil
+    self._buySuppliesTradeReady = false
+    self._buySuppliesPending = nil
+    self._buySuppliesPurchaseConfirmed = false
     self.sellAllCap   = 0         -- sell_all.lua
     self.sellAllNoProgress = 0    -- rounds that sold nothing (REVIEW FIX)
     self.lastRoomMove = 0         -- actions.lua:39 `lastMoved`, the 200 ms throttle
@@ -263,13 +269,15 @@ function cavebot.new(bot, route, opts)
     self.walker.onFloorChangeHook = function(_, info) self:_onFloorChange(info) end
     -- bank transfer scrapes the balance out of an NPC talk (bank.lua:87-91)
     self._talkHandle = self:_busOn('talk', function(d) self:onTalk(d) end)
+    self._tradeHandle = self:_busOn('npcTrade', function(trade)
+        self._buySuppliesTradeReady = true
+        self._buySuppliesTradeNpc = trade and trade.npcName or nil
+    end)
     -- actions.lua:38-66 -- the unconditional "There is not enough room." anti-stuck hook.
     -- It is NOT part of the waypoint loop: it fires off the text message alone whenever
     -- CaveBot is on (REVIEW FIX; docs/vbot/cavebot.md 2.3, last paragraph).
     self._roomHandle = self:_busOn('textMessage', function(d) self:onNotEnoughRoom(d) end)
-    -- tasker.lua's onTextMessage "Loot of X:" counter -- also independent of the waypoint
-    -- loop, since a Loot channel message can arrive between tasker waypoint executions.
-    self._taskerHandle = self:_busOn('textMessage', function(d) self:onTaskerLoot(d) end)
+    self._moneyHandle = self:_busOn('textMessage', function(d) self:onBuySuppliesMessage(d) end)
 
     -- antilost state (antilost.lua)
     self.al = { recovering = false, mode = nil, fallSpot = nil, tpId = nil,
@@ -1206,25 +1214,50 @@ end
 -- ===========================================================================
 -- NPC helpers (new_cavebot_lib.lua)
 -- ===========================================================================
+local function trackedCreaturesOnFloor(cb)
+    local pp = cb.state.player and cb.state.player.pos
+    local out = {}
+    if not pp then return 'none' end
+    local creatures = cb.world and cb.world.spectators
+        and cb.world:spectators(pp, false) or {}
+    for _, c in ipairs(creatures) do
+        if c.pos then
+            out[#out + 1] = string.format('%s#%s@%d,%d,%d',
+                tostring(c.name or '<unnamed>'), tostring(c.id or '?'),
+                c.pos.x, c.pos.y, c.pos.z)
+        end
+    end
+    table.sort(out)
+    return #out > 0 and table.concat(out, ', ') or 'none'
+end
+
 function CB:creatureByName(name)
     local want = tostring(name):lower()
     local pp = self.state.player and self.state.player.pos
-    for _, c in pairs(self.state.creatures or {}) do
-        if c.pos and pp and c.pos.z == pp.z and tostring(c.name or ''):lower() == want then
+    if not pp then return nil end
+    local creatures = self.world and self.world.spectators
+        and self.world:spectators(pp, false) or {}
+    for _, c in ipairs(creatures) do
+        if c.pos and tostring(c.name or ''):lower() == want then
             return c
         end
     end
     return nil
 end
 
---- CaveBot.ReachNPC(name): true when we are within 3 sqm, otherwise walk and answer false
+--- CaveBot.ReachNPC(name, range): true when we are within range sqm, otherwise walk and answer false
 --- (the caller returns "retry").
-function CB:reachNPC(name)
+function CB:reachNPC(name, range)
     local npc = self:creatureByName(name)
     if not npc or not npc.pos then return false end
     local pp = self.state.player and self.state.player.pos
-    if pp and cheb(pp, npc.pos) <= 3 then return true end
-    self:walkTo(npc.pos, 20, { ignoreCreatures = true, precision = 3 })
+    if pp and cheb(pp, npc.pos) <= (range or 3) then return true end
+    local walkParams = { ignoreCreatures = true, precision = 3 }
+    if range and range <= 1 then
+        walkParams.marginMin = 1
+        walkParams.marginMax = 1
+    end
+    self:walkTo(npc.pos, 20, walkParams)
     return false
 end
 
@@ -1298,6 +1331,288 @@ function CB:_unimplemented(name, reason)
                      :format(name, reason))
         return false
     end)
+end
+
+local IMBUING_SHRINES = { [25060] = true, [25061] = true, [25182] = true, [25183] = true }
+
+local function imbuementPickMatches(pick, imbuement)
+    if not (pick and imbuement) then return false end
+    if pick.id and tonumber(pick.id) == tonumber(imbuement.id) then return true end
+    local pickName = tostring(pick.name or ''):lower()
+    local name = tostring(imbuement.name or ''):lower()
+    if pickName ~= '' and pickName == name then return true end
+    if pick.base and name:find(tostring(pick.base):lower(), 1, true) then
+        return not pick.tier or tostring(imbuement.group or imbuement.tier):lower()
+            == tostring(pick.tier):lower()
+    end
+    return false
+end
+
+local function trackerPickMatches(pick, activeName)
+    if not (pick and activeName) then return false end
+    local name = tostring(activeName):lower()
+    if pick.name and tostring(pick.name):lower() == name then return true end
+    return pick.base and name:find(tostring(pick.base):lower(), 1, true) ~= nil
+end
+
+function CB:_imbuementWork()
+    local storage = self.bot and self.bot.storage
+    local config = storage and storage.autoImbue
+    local items = config and config.items
+    if type(items) ~= 'table' then return {}, config end
+
+    local ids = {}
+    for id in pairs(items) do
+        local numericId = tonumber(id)
+        if numericId then ids[#ids + 1] = numericId end
+    end
+    table.sort(ids, function(a, b) return a < b end)
+
+    local work = {}
+    for _, id in ipairs(ids) do
+        local itemConfig = items[tostring(id)] or items[id]
+        if type(itemConfig) == 'table' and type(itemConfig.slotPicks) == 'table' then
+            local item = self.bot.api and self.bot.api.findItem(id)
+            if item then
+                work[#work + 1] = { id = id, config = itemConfig, item = item }
+            else
+                self.log.warn('[CaveBot] imbuing item %s is not available', tostring(id))
+            end
+        end
+    end
+    return work, config
+end
+
+function CB:_imbuementTrackerItem(itemId)
+    for _, entry in ipairs(self.state.imbuementTracker or {}) do
+        if entry.item and tonumber(entry.item.id) == tonumber(itemId) then return entry end
+    end
+    return nil
+end
+
+function CB:_imbuementNeeds(itemConfig, itemId)
+    local tracker = self:_imbuementTrackerItem(itemId)
+    if not tracker then return false, false end
+    local minimum = tonumber(itemConfig.minSeconds) or 3600
+    for slot, pick in pairs(itemConfig.slotPicks or {}) do
+        local active = tracker.slots and tracker.slots[tonumber(slot)]
+        if not active or (tonumber(active.duration) or 0) < minimum then return true, true end
+        if not trackerPickMatches(pick, active.name) then return true, true end
+    end
+    return false, true
+end
+
+function CB:_imbuementShrine()
+    local player = self.state.player
+    if not (player and player.pos) then return nil end
+    for _, tile in ipairs(self:tilesOnFloor(player.pos.z)) do
+        for stack, thing in ipairs(tile.things or {}) do
+            if thing.kind == 'item' and IMBUING_SHRINES[thing.id] then
+                return { pos = tile.pos, id = thing.id, stackPos = stack - 1 }
+            end
+        end
+    end
+    return nil
+end
+
+function CB:_actionImbuing(value, retries)
+    if tostring(value) ~= 'config' then return false end
+    local work, config = self:_imbuementWork()
+    if #work == 0 then return true end
+
+    if retries == 0 or not self._imbueRun then
+        self._imbueRun = { done = {}, lastOp = -math.huge, shrineAt = -math.huge }
+        if self.sender then self.sender:imbuementDurations(true) end
+    end
+    local run = self._imbueRun
+    local now = self.now()
+    if retries > 150 then
+        if self.sender then self.sender:closeImbuingWindow() end
+        self._imbueRun = nil
+        return false
+    end
+
+    local current
+    for _, entry in ipairs(work) do
+        if not run.done[entry.id] then
+            local needs, known = self:_imbuementNeeds(entry.config, entry.id)
+            if known and not needs then run.done[entry.id] = true else current = entry; break end
+        end
+    end
+    if not current then
+        if self.sender then self.sender:closeImbuingWindow() end
+        self._imbueRun = nil
+        return true
+    end
+
+    local shrine = self:_imbuementShrine()
+    if not shrine then
+        self.log.warn('[CaveBot] imbuing shrine not found on the current floor')
+        self._imbueRun = nil
+        return false
+    end
+    if not self:matchPosition(shrine.pos, 1) then
+        self:preciseGoTo(shrine.pos, 1)
+        return 'retry'
+    end
+
+    local window = self.state.imbuementWindow
+    if window and tonumber(window.itemId) == tonumber(current.id) then
+        if now - run.lastOp < 700 then self:delay(200); return 'retry' end
+        local minimum = tonumber(current.config.minSeconds) or 3600
+        for slotString, pick in pairs(current.config.slotPicks) do
+            local slot = tonumber(slotString)
+            if slot and slot < (window.slots or 0) then
+                local active = window.activeSlots and window.activeSlots[slot]
+                local imbuement = active and active[1]
+                local hasActive = imbuement and tonumber(imbuement.id) ~= 0
+                local wrong = hasActive and not imbuementPickMatches(pick, imbuement)
+                local tooLow = hasActive and (tonumber(active[2]) or 0) < minimum
+                if hasActive and (wrong or tooLow) then
+                    self.sender:clearImbuement(slot)
+                    run.lastOp = now
+                    self:delay(700)
+                    return 'retry'
+                elseif not hasActive then
+                    local target
+                    for _, offered in ipairs(window.imbuements or {}) do
+                        if imbuementPickMatches(pick, offered) then target = offered; break end
+                    end
+                    if target then
+                        self.sender:applyImbuement(slot, target.id, config and config.useProtection)
+                        run.lastOp = now
+                        self:delay(900)
+                        return 'retry'
+                    end
+                end
+            end
+        end
+        self.sender:closeImbuingWindow()
+        self.state.imbuementWindow = nil
+        run.done[current.id] = true
+        run.shrineAt = now
+        self:delay(600)
+        return 'retry'
+    end
+
+    if window and now - run.lastOp >= 800 then
+        self.sender:imbuementWindowAction(1, current.id, current.item.pos, current.item.stackPos or 0)
+        run.lastOp = now
+        self:delay(400)
+        return 'retry'
+    end
+
+    if now - run.shrineAt >= 2000 then
+        self.state.imbuementWindow = nil
+        self.sender:use(shrine.pos, shrine.id, shrine.stackPos, 0)
+        run.shrineAt = now
+    end
+    self:delay(500)
+    return 'retry'
+end
+
+function CB:_openMarket()
+    local api = self.bot and self.bot.api
+    if not api then return false end
+    if api.getContainerByName('the market') or (self.state.market and self.state.market.entered) then
+        return true
+    end
+    local locker = api.getContainerByName('Locker')
+    if locker then
+        for index, item in ipairs(locker:getItems()) do
+            if item:getId() == 12903 then
+                local slot = (locker.firstIndex or 0) + index - 1
+                self.sender:openContainer({ x = 0xFFFF, y = 0x40 + locker.id, z = slot },
+                                          item:getId(), slot, 0)
+                self:delay(300)
+                return false
+            end
+        end
+        return false
+    end
+    local player = self.state.player
+    if not (player and player.pos) then return false end
+    for dx = -1, 1 do
+        for dy = -1, 1 do
+            local pos = { x = player.pos.x + dx, y = player.pos.y + dy, z = player.pos.z }
+            local tile = self.state:tile(pos)
+            for stack, thing in ipairs(tile and tile.things or {}) do
+                if thing.kind == 'item' and cavebot.LOCKER_OFFSETS[thing.id] then
+                    self.sender:openContainer(pos, thing.id, stack - 1, 0)
+                    self:delay(300)
+                    return false
+                end
+            end
+        end
+    end
+    return false
+end
+
+function CB:_marketItemCount(itemId)
+    local api = self.bot and self.bot.api
+    if api and api.findItemCount then return api.findItemCount(itemId) end
+    return 0
+end
+
+function CB:_actionMarkecik(value, retries)
+    if not self:isInPz() then return true end
+    local fields = split(value)
+    local itemId, maxPrice, maxAmount = tonumber(fields[1]), tonumber(fields[2]), tonumber(fields[3])
+    if not itemId or not maxPrice or not maxAmount then
+        self.log.warn('[CaveBot] markecik expects itemId,maxPrice,maxAmount: %s', tostring(value))
+        return false
+    end
+
+    local run = self._marketRun
+    if not run or run.itemId ~= itemId or run.maxPrice ~= maxPrice or run.maxAmount ~= maxAmount
+        or retries == 0 then
+        run = { itemId = itemId, maxPrice = maxPrice, maxAmount = maxAmount,
+                initialCount = self:_marketItemCount(itemId), requested = 0, phase = 'open' }
+        self._marketRun = run
+    end
+    if retries >= 150 then
+        self._marketRun = nil
+        return false
+    end
+    if run.maxAmount <= run.initialCount + run.requested then
+        self._marketRun = nil
+        return true
+    end
+    if run.phase == 'open' then
+        if not self:_openMarket() then return 'retry' end
+        run.phase = 'browse'
+    end
+    if run.phase == 'browse' then
+        local browse = self.state.market and self.state.market.browse
+        if not browse or tonumber(browse.itemId) ~= itemId then
+            self.sender:marketBrowse(3, itemId, 0, false)
+            self.state.market.browse = nil
+            self:delay(500)
+            return 'retry'
+        end
+        local required = run.maxAmount - run.initialCount - run.requested
+        local offers = {}
+        for _, offer in ipairs(browse.offers or {}) do
+            if offer.action == 1 and tonumber(offer.itemId) == itemId
+                and tonumber(offer.price) <= run.maxPrice and (offer.amount or 0) > 0 then
+                offers[#offers + 1] = offer
+            end
+        end
+        table.sort(offers, function(a, b) return a.price < b.price end)
+        local offer = offers[1]
+        if not offer then
+            self._marketRun = nil
+            self.log.warn('[CaveBot] markecik found no offer for item %d below %d', itemId, maxPrice)
+            return false
+        end
+        local amount = math.min(required, offer.amount)
+        self.sender:marketAccept(offer.timestamp, offer.counter, amount)
+        run.requested = run.requested + amount
+        self.state.market.browse = nil
+        self:delay(700)
+        return 'retry'
+    end
+    return 'retry'
 end
 
 function CB:_registerActions()
@@ -1387,11 +1702,27 @@ function CB:_registerActions()
     -- ---- talking ---------------------------------------------------------
     A('say', function(cb, v)
         if cb.sender then cb.sender:talk(1, 0, '', tostring(v)) end   -- MessageSay
+        -- Temple routes issue `!quickloot add,...` which the server MERGES into
+        -- the accepted list. Re-apply TargetBot accept-only after each command.
+        if tostring(v):lower():find('!quickloot', 1, true) then
+            local tb = cb.bot and cb.bot.modules and cb.bot.modules.targetbot
+            if tb and tb.scheduleQuickLootSync then
+                tb:scheduleQuickLootSync('CaveBot say !quickloot')
+            end
+        end
         return true
     end)
 
     A('npcsay', function(cb, v)
         if cb.sender then cb.sender:talk(11, 0, '', tostring(v)) end  -- MessageNpcTo
+        -- Temple routes issue `!quickloot add,...` which the server MERGES into
+        -- the accepted list. Re-apply TargetBot accept-only after each command.
+        if tostring(v):lower():find('!quickloot', 1, true) then
+            local tb = cb.bot and cb.bot.modules and cb.bot.modules.targetbot
+            if tb and tb.scheduleQuickLootSync then
+                tb:scheduleQuickLootSync('CaveBot npcsay !quickloot')
+            end
+        end
         return true
     end)
 
@@ -1399,7 +1730,11 @@ function CB:_registerActions()
     A('follow', function(cb, v)
         local c = cb:creatureByName(trim(v))
         if not c then
-            cb.log.info('[CaveBot] follow: creature %s not found', tostring(v))
+            cb.log.warn('[CaveBot] follow: creature %s not found; floor %s creatures: %s',
+                        tostring(v),
+                        tostring(cb.state.player and cb.state.player.pos
+                                 and cb.state.player.pos.z or '?'),
+                        trackedCreaturesOnFloor(cb))
             return false
         end
         local pp = cb.state.player and cb.state.player.pos
@@ -1464,26 +1799,19 @@ function CB:_registerActions()
     A('buysupplies', function(cb, v, retries) return cb:_actionBuySupplies(v, retries) end)
     A('sellall',     function(cb, v, retries) return cb:_actionSellAll(v, retries) end)
     A('depositor',   function(cb, v, retries) return cb:_actionDepositor(v, retries, false) end)
-    A('stowdeposit', function(cb, v, retries) return cb:_actionStowDeposit(v, retries) end)
+    A('stowdeposit', function(cb, v, retries) return cb:_actionDepositor(v, retries, true) end)
     A('bank',        function(cb, v, retries) return cb:_actionBank(v, retries) end)
     A('travel',      function(cb, v, retries) return cb:_actionTravel(v, retries) end)
+    A('markecik',    function(cb, v, retries) return cb:_actionMarkecik(v, retries) end)
 
-    -- ---- withdraw family (withdraw.lua / d_withdraw.lua / inbox_withdraw.lua) ---------
-    A('withdraw',   function(cb, v, retries) return cb:_actionWithdraw(v, retries) end)
-    A('dpwithdraw', function(cb, v, retries) return cb:_actionDpWithdraw(v, retries) end)
-    A('inwithdraw', function(cb, v, retries) return cb:_actionInWithdraw(v, retries) end)
-
-    -- ---- imbuing (imbuing.lua) -------------------------------------------
+    -- ---- known but blocked on protocol builders luaclient does not have --
+    self:_unimplemented('forge',      'g_game.forgeRequest has no proto/sender.lua builder')
     A('imbuing', function(cb, v, retries) return cb:_actionImbuing(v, retries) end)
-
-    -- ---- rushlure / stand lure (stand_lure.lua) --------------------------
-    A('rushlure', function(cb, v, retries) return cb:_actionRushLure(v, retries) end)
-
-    -- ---- tasker (tasker.lua) ----------------------------------------------
-    A('tasker', function(cb, v, retries) return cb:_actionTasker(v, retries) end)
-
-    -- ---- forge (route_tools.lua) -------------------------------------------
-    A('forge', function(cb, v, retries) return cb:_actionForge(v, retries) end)
+    self:_unimplemented('tasker',     'needs the NPC task dialogue + Loot-of message counter')
+    self:_unimplemented('rushlure',   'needs TargetBot lure arbitration (work item M3)')
+    self:_unimplemented('withdraw',   'needs the depot-box withdraw primitives')
+    self:_unimplemented('dpwithdraw', 'needs the depot-box withdraw primitives')
+    self:_unimplemented('inwithdraw', 'needs the inbox withdraw primitives')
 end
 
 -- ---------------------------------------------------------------------------
@@ -1598,24 +1926,6 @@ function CB:_actionGoto(value, retries)
     return 'retry'
 end
 
---- Turn on Chase mode the way the real client's Game::setChaseMode does
---- (src/client/game.cpp:1295-1304): it only ever touches m_chaseMode and resends the OTHER
---- three fields (fight/safe/pvp) exactly as they already were.  REVIEW FIX: the native port
---- was calling `self.sender:setFightMode(nil, 1, nil, nil)`, and proto/sender.lua's boolByte
---- encodes a literal `nil` as 0 -- so every routine "a monster is blocking my path" chase-on
---- silently reset Safe Fight to OFF and PvP mode to White Dove on the wire, regardless of the
---- player's real settings.  self.state.safeMode/pvpMode are the two fields proto/parser.lua's
---- S[0xA7] (PlayerModes) tracks from the server; game.cpp:69-70's own startup defaults
---- (m_safeFight = true, m_pvpMode = WhiteDove/0) are the fallback for the window before the
---- first PlayerModes packet has arrived.
-function CB:_chaseKeepingModes()
-    if not self.sender then return end
-    local safe = self.state.safeMode
-    if safe == nil then safe = true end
-    local pvp = self.state.pvpMode or 0
-    self.sender:setFightMode(nil, 1, safe, pvp)
-end
-
 --- goto step 7 (actions.lua:452-479).  VERIFIER: only the FIRST creature on each tile is
 --- examined (`tile:getCreatures()[1]`), so a player stacked first hides a monster behind it.
 --- The player-position aliasing bug is NOT reproduced (luaclient's st.player.pos is a LIVE
@@ -1640,7 +1950,7 @@ function CB:_attackBlockingMonster(pp, path)
                         if self.bot then self.bot._attacking = c.id end
                     end
                 end
-                self:_chaseKeepingModes()
+                if self.sender then self.sender:setFightMode(nil, 1, nil, nil) end
                 self:delay(100)
                 return true
             end
@@ -1788,6 +2098,15 @@ local function dotProxy(obj)
     if type(obj) ~= 'table' then return nil end
     return setmetatable({}, {
         __index = function(_, k)
+            if k == 'ReachAndOpenDepot' then
+                return function(...) return obj:reachAndOpenDepot(...) end
+            end
+            if k == 'OpenDepotChest' then
+                return function(...) return obj:openDepotChest(...) end
+            end
+            if k == 'OpenLocker' then
+                return function(...) return obj:openDepotChest(...) end
+            end
             local v = obj[k]
             if type(v) ~= 'function' then return v end
             return function(...)
@@ -1811,6 +2130,16 @@ function CB:_actionFunction(src, retries, prev)
         macro     = function() cb.log.warn('[CaveBot] macro() is not available inside a '
                                            .. 'function waypoint') end,
         CaveBot   = dotProxy(cb),
+        modules   = {
+            game_market = {
+                Market = {
+                    close = function()
+                        if cb.sender then cb.sender:marketLeave() end
+                        if cb.state.market then cb.state.market.entered = false end
+                    end,
+                },
+            },
+        },
         TargetBot = dotProxy(cb.bot and cb.bot.modules and cb.bot.modules.targetbot) or {
             setOn = function() end, setOff = function() end, isOn = function() return false end,
         },
@@ -1831,40 +2160,6 @@ function CB:_actionFunction(src, retries, prev)
         return false
     end
     return r                                     -- the return value IS the action's result
-end
-
--- ---------------------------------------------------------------------------
--- forge (route_tools.lua:59-90) -- Exaltation Forge: convert dust to slivers, or
--- increase the dust limit.  value is "convert[,times]" or "limit[,times]"; times
--- clamps to 1..50 and defaults to 1.  Each retry sends exactly one forgeRequest and
--- waits 800 ms, exactly like the real waypoint, until `count` requests have gone out.
--- ---------------------------------------------------------------------------
-function CB:_actionForge(value, retries)
-    local d = split(value)
-    local mode = tostring(d[1] or ''):lower()
-    local count = max(1, min(50, tonumber(d[2]) or 1))
-
-    local actionType, label
-    if mode == 'convert' then
-        actionType, label = 2, 'converting dust to slivers'      -- Otc::ForgeAction_t::DUST2SLIVER
-    elseif mode == 'limit' then
-        actionType, label = 4, 'increasing dust limit'           -- Otc::ForgeAction_t::INCREASELIMIT
-    else
-        self.log.warn('[CaveBot] forge: invalid value %s, use: convert[,times] or limit[,times]',
-                      tostring(value))
-        return false
-    end
-
-    if retries >= count then return true end   -- all requested forge actions were sent
-
-    -- 70 = ResourceTypes.FORGE_DUST (route_tools.lua:81 -- the constant table is not
-    -- exposed to the bot sandbox); informational only, the server validates the actual
-    -- cost and rejects an impossible request itself.
-    local dust = (self.state.resources and self.state.resources[70]) or 0
-    self.log.info('[CaveBot] forge: %s (%d/%d), dust: %s', label, retries + 1, count, tostring(dust))
-    if self.sender then self.sender:forgeRequest(actionType) end
-    self:setDelay(800)             -- route_tools.lua:86, a PLAIN delay() (OVERWRITE)
-    return 'retry'
 end
 
 -- ---------------------------------------------------------------------------
@@ -1953,7 +2248,10 @@ end
 -- opendoors (doors.lua:4-49)
 -- ---------------------------------------------------------------------------
 function CB:_actionOpenDoors(value, retries)
-    if retries >= 5 then return false end
+    if retries >= 5 then
+        self.log.warn('[CaveBot] opendoors gave up after %d retries: %s', retries, tostring(value))
+        return false
+    end
     local d = split(value)
     local x, y, z = tonumber(d[1]), tonumber(d[2]), tonumber(d[3])
     local keyId = tonumber(d[4])
@@ -1962,19 +2260,55 @@ function CB:_actionOpenDoors(value, retries)
         return false
     end
     local pos = { x = x, y = y, z = z }
+    local pp = self.state.player and self.state.player.pos
+    if not pp then
+        self.log.warn('[CaveBot] opendoors has no player position: %s', tostring(value))
+        return false
+    end
+    if pp.z ~= pos.z then
+        self.log.warn('[CaveBot] opendoors target is on floor %d, player is on floor %d: %s',
+                      pos.z, pp.z, tostring(value))
+        return false
+    end
     local tile = self.state:tile(pos)
-    if not tile then return false end
+    if not tile then
+        self.log.warn('[CaveBot] opendoors tile is not loaded at %d,%d,%d', x, y, z)
+        return false
+    end
     -- VERIFIER: Tile:isWalkable() is called with NO argument, so any non-passable creature
     -- standing in the doorway makes the tile "not walkable".
-    if self.world:isWalkable(tile, false) then return true end
+    if self.world:isWalkable(tile, false) then
+        self.log.info('[CaveBot] opendoors already walkable at %d,%d,%d', x, y, z)
+        return true
+    end
     local thing, stack = self:topUseAt(pos)
-    if thing and self.sender then
-        if keyId then
-            self.sender:useWith({ x = 0xFFFF, y = 0, z = 0 }, keyId, 0,
-                                pos, thing.id or 0, stack or 0)
-        else
-            self.sender:use(pos, thing.id or 0, stack or 0, 0)
-        end
+    if not thing then
+        self.log.warn('[CaveBot] opendoors blocked but no top-use item at %d,%d,%d (retry %d/5)',
+                      x, y, z, retries + 1)
+        self:setDelay(200)
+        return 'retry'
+    end
+    if not self.sender then
+        self.log.warn('[CaveBot] opendoors has no sender for item %s at %d,%d,%d',
+                      tostring(thing.id), x, y, z)
+        self:setDelay(200)
+        return 'retry'
+    end
+    local body, err
+    if keyId then
+        body, err = self.sender:useWith({ x = 0xFFFF, y = 0, z = 0 }, keyId, 0,
+                                         pos, thing.id or 0, stack or 0)
+    else
+        body, err = self.sender:use(pos, thing.id or 0, stack or 0, 0)
+    end
+    if body then
+        self.log.info('[CaveBot] opendoors use sent: item=%s stack=%s key=%s at %d,%d,%d retry=%d',
+                      tostring(thing.id), tostring(stack), tostring(keyId or 'none'),
+                      x, y, z, retries + 1)
+    else
+        self.log.warn('[CaveBot] opendoors use failed: item=%s stack=%s key=%s at %d,%d,%d: %s',
+                      tostring(thing.id), tostring(stack), tostring(keyId or 'none'),
+                      x, y, z, tostring(err))
     end
     self:setDelay(200)
     return 'retry'
@@ -2107,12 +2441,44 @@ end
 -- buysupplies (buy_supplies.lua:14-99)
 -- ---------------------------------------------------------------------------
 function CB:_actionBuySupplies(value, retries)
+    if self._buySuppliesFailed then
+        self._buySuppliesFailed = false
+        self.noProgress = 0
+        self.log.warn('[CaveBot] buysupplies skipped: insufficient money')
+        return false
+    end
+    if self._buySuppliesCapacityFailed then
+        self._buySuppliesCapacityFailed = false
+        self.noProgress = 0
+        self.log.warn('[CaveBot] buysupplies skipped: insufficient capacity')
+        return false
+    end
     local d = split(value)
     local npcName = d[1]
     local waitMs  = tonumber(d[2])
-    if retries == 0 then self.noProgress = 0 end
+    -- Original BuySupplies accepts only "NPC" or "NPC,delay". Start every action
+    -- with a fresh hi/trade against this NPC, matching CaveBot.OpenNpcTrade().
+    if retries == 0 or self._buySuppliesNpc ~= npcName then
+        self.noProgress = 0
+        self._buySuppliesNpc = npcName
+        self._buySuppliesTradeReady = false
+        self._buySuppliesTradeNpc = nil
+        self._buySuppliesTradeNpc = nil
+        self._buySuppliesPending = nil
+        self._buySuppliesPurchaseConfirmed = false
+        if self:npcTradeOpen() and self.sender and self.sender.closeNpcTrade then
+            self.sender:closeNpcTrade()
+            self.state.npcTrade = { open = false, items = {} }
+        end
+    end
     local npc = self:creatureByName(npcName)
     if not npc then
+        -- The map can deliver a known-creature update a few frames after the route reaches
+        -- the NPC. Give that update a short window before applying the original hard skip.
+        if retries < 10 then
+            self:delay(200)
+            return 'retry'
+        end
         self.log.info('[CaveBot] buysupplies: npc %s not found', tostring(npcName))
         self.noProgress = 0                     -- buy_supplies.lua:43
         return false
@@ -2123,7 +2489,7 @@ function CB:_actionBuySupplies(value, retries)
         self.log.warn('[CaveBot] buysupplies gave up (no progress)')
         return false
     end
-    if not self:reachNPC(npcName) then
+    if not self:reachNPC(npcName, cavebot.NPC_TALK_RANGE) then
         self.noProgress = self.noProgress + 1
         return 'retry'
     end
@@ -2133,6 +2499,42 @@ function CB:_actionBuySupplies(value, retries)
         self.noProgress = self.noProgress + 1
         return 'retry'
     end
+    if not self._buySuppliesTradeReady then
+        self:delay(self:talkDelay())
+        return 'retry'
+    end
+    local trade = self.state.npcTrade
+    if trade and trade.npcName
+       and tostring(trade.npcName):lower() ~= tostring(npcName):lower() then
+        self._buySuppliesTradeReady = false
+        self._buySuppliesTradeNpc = nil
+        if self.sender and self.sender.closeNpcTrade then self.sender:closeNpcTrade() end
+        self.state.npcTrade = { open = false, items = {} }
+        self:delay(self:talkDelay())
+        return 'retry'
+    end
+
+    -- A buy packet is asynchronous. Do not inspect the same pre-purchase supply
+    -- snapshot again until the server confirms the purchase or inventory catches up.
+    local pending = self._buySuppliesPending
+    if pending then
+        local have = self.supplies:itemAmount(pending.id)
+        if self._buySuppliesPurchaseConfirmed or have > pending.before then
+            self._buySuppliesPending = nil
+            self._buySuppliesPurchaseConfirmed = false
+        else
+            if self:now() < pending.untilAt then
+                self:delay(200)
+                return 'retry'
+            end
+            self.log.warn('[CaveBot] buysupplies: no server confirmation for item %d',
+                          pending.id)
+            self._buySuppliesPending = nil
+            self._buySuppliesPurchaseConfirmed = false
+            self.noProgress = self.noProgress + 1
+            return 'retry'
+        end
+    end
 
     local offers = self:npcOffers()
     -- buy_supplies.lua:70-76 builds possibleItems from NPC.getBuyItems(); an unknown or
@@ -2141,22 +2543,61 @@ function CB:_actionBuySupplies(value, retries)
     local function sells(id)
         if offers == nil then return false end
         for _, o in ipairs(offers) do
-            if (o.id or o.itemId) == id then return true end
+            if (o.id or o.itemId) == id and (o.buyPrice == nil or o.buyPrice > 0) then
+                return true
+            end
         end
         return false
     end
 
     for _, entry in ipairs(self.supplies:buyList()) do
         if sells(entry.id) then
-            if self.sender then
-                self.sender:buyItem(entry.id, 0, entry.amount, false, false)
+            local offerSubtype = 0
+            for _, offer in ipairs(offers or {}) do
+                if (offer.id or offer.itemId) == entry.id then
+                    offerSubtype = offer.subType or offer.subtype or 0
+                    break
+                end
             end
+            if self.sender then
+                self.sender:buyItem(entry.id, offerSubtype, entry.amount, false, false)
+            end
+            self._buySuppliesPending = {
+                id = entry.id,
+                before = self.supplies:itemAmount(entry.id),
+                untilAt = self:now() + 5000,
+            }
+            self._buySuppliesPurchaseConfirmed = false
             self.noProgress = 0
             return 'retry'
         end
     end
+    -- buy_supplies.lua:97-99: nothing on this NPC's current buy list matches, so
+    -- the original client reports "bought everything, proceeding".
+    self.log.info('[CaveBot] buysupplies %s: bought everything, proceeding', tostring(npcName))
     self.noProgress = 0
     return true
+end
+
+function CB:onBuySuppliesMessage(d)
+    if self.currentAction ~= 'buysupplies' then return false end
+    local text = tostring(type(d) == 'table' and d.text or d or ''):lower()
+    if text:find('bought ', 1, true) then
+        self._buySuppliesPurchaseConfirmed = true
+        return true
+    end
+    if text:find('not enough money', 1, true)
+       or text:find("don't have enough money", 1, true)
+       or text:find('insufficient funds', 1, true) then
+        self._buySuppliesFailed = true
+        return true
+    end
+    if text:find('do not have enough capacity', 1, true)
+       or text:find('not enough capacity', 1, true) then
+        self._buySuppliesCapacityFailed = true
+        return true
+    end
+    return false
 end
 
 -- ---------------------------------------------------------------------------
@@ -2184,54 +2625,198 @@ function CB:_actionSellAll(value, retries)
         for _, id in ipairs(sell) do exceptions[id] = true end
     end
 
+    local function sellLog(fmt, ...)
+        self.log.info('[CaveBot] sellall: ' .. fmt, ...)
+    end
+
+    if retries == 0 then
+        self.sellAllPending = nil
+        sellLog('start npc=%s withDelay=%s', tostring(npcName), tostring(withDelay))
+    end
+
     local npc = self:creatureByName(npcName)
-    if not npc then return false end
+    if not npc then
+        sellLog('npc %s not found; skipping sell action', tostring(npcName))
+        return false
+    end
     -- REVIEW FIX: upstream's `retries > 10` guarded a handful of round trips because
     -- modules.game_npctrade.sellAll() emptied the backpacks in ONE call.  We sell one id
     -- per invocation, so charging every sale to the same budget capped a whole visit at
     -- ~11 items.  Count rounds that made NO progress instead (as buy_supplies.lua does).
     if retries == 0 then self.sellAllNoProgress = 0 end
     if (self.sellAllNoProgress or 0) > 10 or retries > suppliesmod.MAX_ROUNDS then
+        sellLog('gave up npc=%s retries=%d noProgress=%d', tostring(npcName), retries,
+                self.sellAllNoProgress or 0)
         self.sellAllNoProgress = 0
         return false
     end
 
-    local cap = self.supplies:freeCap()
-    if cap == self.sellAllCap then
-        self.sellAllCap = 0
-        self.sellAllNoProgress = 0
-        return true
+    local pending = self.sellAllPending
+    if pending then
+        local currentCount = 0
+        local pendingTrade = self.state.npcTrade
+        if type(pendingTrade) == 'table' and type(pendingTrade.playerGoods) == 'table' then
+            currentCount = tonumber(pendingTrade.playerGoods[pending.itemId]) or 0
+        else
+            for _, c in pairs(self.state.containers or {}) do
+                local n = tostring(c.name or ''):lower()
+                if not (n:find('depot') or n:find('locker') or n:find('inbox')) then
+                    for _, item in ipairs(c.items or {}) do
+                        if tonumber(item.id) == pending.itemId then
+                            currentCount = currentCount + (tonumber(item.count) or 1)
+                        end
+                    end
+                end
+            end
+        end
+        local resolved = currentCount < pending.beforeCount
+        if resolved then
+            sellLog('confirmed item=%d sold=%d remaining=%d', pending.itemId,
+                    pending.requested, currentCount)
+            self.sellAllPending = nil
+            self.sellAllNoProgress = 0
+        elseif self:now() < pending.untilAt then
+            if not pending.waitLogged then
+                sellLog('waiting for server confirmation item=%d', pending.itemId)
+                pending.waitLogged = true
+            end
+            self:setDelay(200)
+            return 'retry'
+        else
+            sellLog('sell confirmation timeout item=%d', pending.itemId)
+            self.sellAllPending = nil
+            self.sellAllNoProgress = (self.sellAllNoProgress or 0) + 1
+            return 'retry'
+        end
     end
+
     self:setDelay(800)                               -- sell_all.lua:38, a PLAIN delay()
     if not self:reachNPC(npcName) then
+        sellLog('waiting for npc=%s retry=%d', tostring(npcName), retries)
         self.sellAllNoProgress = (self.sellAllNoProgress or 0) + 1
         return 'retry'
     end
     if not self:npcTradeOpen() then
+        sellLog('opening trade with npc=%s retry=%d', tostring(npcName), retries)
         self:conversation('hi', 'trade')
         self:setDelay(self:talkDelay() * 2)          -- sell_all.lua:45, a PLAIN delay()
         self.sellAllNoProgress = (self.sellAllNoProgress or 0) + 1
         return 'retry'
     end
-    self.sellAllCap = cap
+    local offers = self:npcOffers()
+    local trade = self.state.npcTrade
+    if trade.npcName and tostring(trade.npcName):lower() ~= tostring(npcName):lower() then
+        sellLog('trade belongs to npc=%s, expected=%s; reopening', tostring(trade.npcName),
+                tostring(npcName))
+        if self.sender and self.sender.closeNpcTrade then self.sender:closeNpcTrade() end
+        self.state.npcTrade = { open = false, items = {} }
+        self.sellAllNoProgress = (self.sellAllNoProgress or 0) + 1
+        return 'retry'
+    end
+    sellLog('trade open npc=%s tradeNpc=%s offers=%d freeCapacity=%s',
+            tostring(npcName), tostring(self.state.npcTrade.npcName or '?'),
+            type(offers) == 'table' and #offers or 0, tostring(self.supplies:freeCap()))
 
-    for _, c in pairs(self.state.containers or {}) do
-        local n = tostring(c.name or ''):lower()
-        if not (n:find('depot') or n:find('locker') or n:find('inbox')) then
-            for _, it in ipairs(c.items or {}) do
-                if it.id and not exceptions[it.id] then
-                    if self.sender then
-                        self.sender:sellItem(it.id, 0, it.count or 1, true)
+    local sellOffers = {}
+    if type(offers) == 'table' then
+        for _, offer in ipairs(offers) do
+            local itemId = tonumber(offer.id or offer.itemId)
+            if itemId and tonumber(offer.sellPrice) and tonumber(offer.sellPrice) > 0 then
+                sellOffers[itemId] = offer
+            end
+        end
+    end
+    if next(sellOffers) == nil then
+        sellLog('no sell offers available from npc=%s', tostring(npcName))
+        self.sellAllNoProgress = (self.sellAllNoProgress or 0) + 1
+        return 'retry'
+    end
+
+    local candidates = {}
+    local goods = trade.playerGoods
+    if type(goods) == 'table' then
+        for itemId, amount in pairs(goods) do
+            itemId = tonumber(itemId)
+            amount = tonumber(amount) or 0
+            local offer = itemId and sellOffers[itemId]
+            if itemId and amount > 0 and offer and not exceptions[itemId] then
+                candidates[itemId] = { offer = offer, count = amount, goodsCount = amount }
+            end
+        end
+
+        -- PlayerGoods is an aggregate, so remove equipped copies before sending a
+        -- sell request.  The GUI's ignoreEquipped option applies to slots 1..10.
+        for slot = 1, 10 do
+            local equipped = self.state.player and self.state.player.inventory
+                             and self.state.player.inventory[slot]
+            local itemId = equipped and tonumber(equipped.id)
+            local candidate = itemId and candidates[itemId]
+            if candidate then
+                candidate.count = math.max(0, candidate.count - (tonumber(equipped.count) or 1))
+            end
+        end
+    else
+        for _, c in pairs(self.state.containers or {}) do
+            local n = tostring(c.name or ''):lower()
+            if not (n:find('depot') or n:find('locker') or n:find('inbox')) then
+                for _, item in ipairs(c.items or {}) do
+                    local itemId = tonumber(item.id)
+                    local offer = itemId and sellOffers[itemId]
+                    if itemId and offer and not exceptions[itemId] then
+                        local candidate = candidates[itemId]
+                        if candidate then
+                            candidate.count = candidate.count + (tonumber(item.count) or 1)
+                        else
+                            candidates[itemId] = {
+                                offer = offer,
+                                count = tonumber(item.count) or 1,
+                            }
+                        end
                     end
-                    if withDelay then self:setDelay(self:talkDelay()) end
-                    self.sellAllNoProgress = 0
-                    return 'retry'
                 end
             end
         end
     end
-    self.sellAllNoProgress = (self.sellAllNoProgress or 0) + 1
-    return 'retry'
+
+    local function sendCandidate(itemId, candidate)
+        local count = math.min(candidate.count, 100)
+        local offer = candidate.offer
+        local subType = tonumber(offer.subType or offer.subtype) or 0
+        local body, err
+        if self.sender then
+            body, err = self.sender:sellItem(itemId, subType, count, true)
+        else
+            err = 'no sender'
+        end
+        sellLog('sell request npc=%s item=%d subtype=%d count=%d available=%d sent=%s%s',
+            tostring(npcName), itemId, subType, count, candidate.count,
+                tostring(body ~= nil), err and (' error=' .. tostring(err)) or '')
+        if not body then
+            self.sellAllNoProgress = (self.sellAllNoProgress or 0) + 1
+            return 'failed'
+        end
+        self.sellAllPending = {
+            itemId = itemId,
+            requested = count,
+            beforeCount = candidate.goodsCount or candidate.count,
+            untilAt = self:now() + 5000,
+        }
+        if withDelay then self:setDelay(self:talkDelay()) end
+        self.sellAllNoProgress = 0
+        return true
+    end
+
+    for itemId, candidate in pairs(candidates) do
+        if candidate.count > 0 then
+            local result = sendCandidate(itemId, candidate)
+            if result == 'failed' then return 'retry' end
+            if result then return 'retry' end
+        end
+    end
+
+    sellLog('finished npc=%s; no sellable items remain', tostring(npcName))
+    self.sellAllNoProgress = 0
+    return true
 end
 
 -- ---------------------------------------------------------------------------
@@ -2357,159 +2942,6 @@ function CB:_stashingIndex(id)
 end
 
 -- ---------------------------------------------------------------------------
--- stowdeposit (depositor.lua:139-227): stash first, depot second.  "Stow all items of
--- this type" (g_game.stashStowItem, action STOW_STACK=2) empties every stack of that
--- item id from all open containers in one packet; anything the stash refuses (tiered
--- items, or ids the server just won't take) falls back to the normal depot move.  A
--- per-item 3-try cache (stowAttempts/stowFallback) matches the real script exactly: an
--- item tried 3 times and never accepted by the stash is marked fallback for good and
--- never re-offered to the stash again this run.
--- ---------------------------------------------------------------------------
-function CB:_resetStowCache()
-    self._stowAttempts, self._stowFallback, self._stowReopened = nil, nil, nil
-end
-
---- canStow(item) (depositor.lua:151-157): the server must have advertised a supply
---- stash, the item must be pickupable, and it must carry no tier (a forged/upgraded
---- item is refused by the real stash too).
-function CB:_canStow(it)
-    if not (self.state.player and self.state.player.supplyStashAvailable) then return false end
-    if not self:_itemFlag('isPickupable', it.id, false) then return false end
-    return (tonumber(it.tier) or 0) <= 0
-end
-
-function CB:_actionStowDeposit(value, retries)
-    value = tostring(value or 'no')
-    local loot = self:lootList()
-    if next(loot) == nil then
-        self.log.info('[CaveBot] stow: no items in loot list. Wrong TargetBot Config? Proceeding')
-        self:_resetStowCache()
-        self:resetLootCache()
-        return true
-    end
-    self:setDelay(70)                                    -- depositor.lua:151 (OVERWRITE)
-
-    -- "yes": reopen the loot containers first so items sitting in nested backpacks
-    -- become reachable, exactly like the plain Depositor's own "yes" mode.
-    if value:lower() == 'yes' then
-        if not self._stowReopened then
-            for _, c in pairs(self.state.containers or {}) do
-                local cid = type(c.item) == 'table' and c.item.id
-                if cid and self._lootContainers and self._lootContainers[cid] and self.sender then
-                    self.sender:closeContainer(c.id)
-                end
-            end
-            self._stowReopened = true
-            self:setDelay(3000)
-            return 'retry'
-        end
-        if not self:_hasLootItems(loot) then
-            -- nested-spare-bag scan: an open loot-container backpack may hold another
-            -- backpack of the SAME item id one level down -- open the first one found.
-            for _, c in pairs(self.state.containers or {}) do
-                local cid = type(c.item) == 'table' and c.item.id
-                if cid and self._lootContainers and self._lootContainers[cid] then
-                    for idx, it in ipairs(c.items or {}) do
-                        if it.id == cid then
-                            local slot = (c.firstIndex or 0) + idx - 1
-                            if self.sender then
-                                self.sender:openContainer(CB.slotPosition(c, slot), it.id, slot, 0)
-                            end
-                            self:setDelay(100)
-                            return 'retry'
-                        end
-                    end
-                end
-            end
-            self.log.info('[CaveBot] stow: all items handled, no backpack to open next, proceeding')
-            self:_resetStowCache()
-            self:resetLootCache()
-            self:setDelay(3000)
-            return true
-        end
-    end
-
-    if retries == 0 and not self:_hasLootItems(loot) then
-        self.log.info('[CaveBot] stow: no items to stash, proceeding')
-        self:_resetStowCache()
-        self:resetLootCache()
-        return true
-    end
-    if retries > 400 then
-        self.log.warn('[CaveBot] stow: action limit reached, proceeding')
-        self:_resetStowCache()
-        self:resetLootCache()
-        return true
-    end
-
-    -- stash and depot are both at the locker, so reach it either way
-    if not self:reachAndOpenDepot() then return 'retry' end
-    self:pingDelay(2)
-
-    self._stowAttempts = self._stowAttempts or {}
-    self._stowFallback = self._stowFallback or {}
-
-    -- PASS 1: stow every loot item the supply stash will accept.
-    for _, c in pairs(self.state.containers or {}) do
-        local n = tostring(c.name or ''):lower()
-        if not (n:find('depot') or n:find('your inbox')) then
-            for idx, it in ipairs(c.items or {}) do
-                local id = it.id
-                if id and loot[id] and not self._stowFallback[id] then
-                    if self:_canStow(it) then
-                        self._stowAttempts[id] = (self._stowAttempts[id] or 0) + 1
-                        -- still here after a few tries? the stash won't take it
-                        if self._stowAttempts[id] > 3 then
-                            self._stowFallback[id] = true
-                            self.log.info('[CaveBot] stow: %d not stowable, will use depot', id)
-                        else
-                            self.log.info('[CaveBot] stow: stowing all of item: %d', id)
-                            local slot = (c.firstIndex or 0) + idx - 1
-                            if self.sender then
-                                -- action 2 == Otc::Supply_Stash_Actions_t::SUPPLY_STASH_ACTION_STOW_STACK
-                                self.sender:stashStowItem(CB.slotPosition(c, slot), id, 0, slot, 2)
-                            end
-                            self:setDelay(200)
-                            return 'retry'
-                        end
-                    else
-                        self._stowFallback[id] = true
-                    end
-                end
-            end
-        end
-    end
-
-    -- PASS 2: whatever the stash refused goes into the depot boxes.
-    local destination = self:getContainerByName('Depot chest')
-    if not destination then return 'retry' end
-
-    for _, c in pairs(self.state.containers or {}) do
-        local n = tostring(c.name or ''):lower()
-        if not (n:find('depot') or n:find('your inbox')) then
-            for idx, it in ipairs(c.items or {}) do
-                if it.id and loot[it.id] then
-                    local index = self:_stashingIndex(it.id)
-                    if index == nil then
-                        index = self:_itemFlag('isStackable', it.id, false) and 1 or 0
-                    end
-                    local slot = (c.firstIndex or 0) + idx - 1
-                    if self.sender then
-                        self.sender:move(CB.slotPosition(c, slot), it.id, slot,
-                                         CB.slotPosition(destination, index), it.count or 1)
-                    end
-                    return 'retry'
-                end
-            end
-        end
-    end
-
-    self:_resetStowCache()
-    self:resetLootCache()
-    return true
-end
-
--- ---------------------------------------------------------------------------
 -- depot reach / open primitives (new_cavebot_lib.lua:307-496)
 -- ---------------------------------------------------------------------------
 function CB:reachDepot()
@@ -2554,58 +2986,34 @@ function CB:reachDepot()
     return false
 end
 
---- OpenLocker (new_cavebot_lib.lua:376-394): open the locker item found on an adjacent
---- tile.  Shared by openDepotChest/openInbox, which both fall back to it when no
---- `Locker` container is open yet.
-function CB:_openLockerItem()
-    local pp = self.state.player and self.state.player.pos
-    if not pp then return false end
-    for dx = -1, 1 do
-        for dy = -1, 1 do
-            local q = { x = pp.x + dx, y = pp.y + dy, z = pp.z }
-            local tile = self.state:tile(q)
-            if tile then
-                for i, t in ipairs(tile.things or {}) do
-                    if t.kind == 'item' and cavebot.LOCKER_OFFSETS[t.id] then
-                        if self.sender then
-                            self.sender:openContainer(q, t.id, i - 1, 0)
+function CB:openDepotChest()
+    if self:getContainerByName('Depot chest') then return true end
+    local locker = self:getContainerByName('Locker')
+    if not locker then
+        -- open the locker item on an adjacent tile
+        local pp = self.state.player and self.state.player.pos
+        if not pp then return false end
+        for dx = -1, 1 do
+            for dy = -1, 1 do
+                local q = { x = pp.x + dx, y = pp.y + dy, z = pp.z }
+                local tile = self.state:tile(q)
+                if tile then
+                    for i, t in ipairs(tile.things or {}) do
+                        if t.kind == 'item' and cavebot.LOCKER_OFFSETS[t.id] then
+                            if self.sender then
+                                self.sender:openContainer(q, t.id, i - 1, 0)
+                            end
+                            self:delay(200)
+                            return false
                         end
-                        self:delay(200)
-                        return false
                     end
                 end
             end
         end
+        return false
     end
-    return false
-end
-
-function CB:openDepotChest()
-    if self:getContainerByName('Depot chest') then return true end
-    local locker = self:getContainerByName('Locker')
-    if not locker then return self:_openLockerItem() end
     for idx, it in ipairs(locker.items or {}) do
         if it.id == cavebot.DEPOT_CHEST_ID then
-            local slot = (locker.firstIndex or 0) + idx - 1
-            if self.sender then
-                self.sender:openContainer({ x = 0xFFFF, y = 0x40 + locker.id, z = slot },
-                                          it.id, slot, 0)
-            end
-            self:delay(200)
-            return false
-        end
-    end
-    return false
-end
-
---- CaveBot.OpenInbox (new_cavebot_lib.lua:427-442): same shape as openDepotChest, but for
---- the "Your inbox" item (id 12902) instead of the depot chest (id 3502).
-function CB:openInbox()
-    if self:getContainerByName('Your inbox') then return true end
-    local locker = self:getContainerByName('Locker')
-    if not locker then return self:_openLockerItem() end
-    for idx, it in ipairs(locker.items or {}) do
-        if it.id == cavebot.INBOX_ID then
             local slot = (locker.firstIndex or 0) + idx - 1
             if self.sender then
                 self.sender:openContainer({ x = 0xFFFF, y = 0x40 + locker.id, z = slot },
@@ -2622,31 +3030,6 @@ function CB:reachAndOpenDepot()
     return self:reachDepot() and self:openDepotChest()
 end
 
-function CB:reachAndOpenInbox()
-    return self:reachDepot() and self:openInbox()
-end
-
---- CaveBot.OpenDepotBox(index) (new_cavebot_lib.lua:444-464).  VERIFIER: once ANY
---- "depot box" container is already open, this returns true regardless of whether it is
---- the box the caller asked for -- reproduced verbatim (dpwithdraw/withdraw only ever have
---- one depot box open at a time in practice).  Opening the requested box is fire-and-forget
---- (no confirmation), so the caller always retries until the next tick's `getContainers`
---- scan sees it.
-function CB:openDepotBox(index)
-    local depot = self:getContainerByName('Depot chest')
-    if not depot then return self:reachAndOpenDepot() end
-    if self:findContainerMatching('depot box') then return true end
-    local it = (depot.items or {})[index]
-    if it then
-        local slot = (depot.firstIndex or 0) + index - 1
-        if self.sender then
-            self.sender:openContainer({ x = 0xFFFF, y = 0x40 + depot.id, z = slot },
-                                      it.id, slot, 0)
-        end
-    end
-    return false
-end
-
 -- ---------------------------------------------------------------------------
 -- bank (bank.lua:6-78) and travel (travel.lua:4-33)
 -- ---------------------------------------------------------------------------
@@ -2660,6 +3043,10 @@ function CB:_actionBank(value, retries)
     if kind == 'withdraw' and not tonumber(d[3]) then
         self.log.warn('[CaveBot] bank: incorrect amount value, should be a number, is: %s',
                       tostring(d[3]))
+        return false
+    end
+    if kind == 'transfer' and (#d ~= 4 or d[3] == '' or not tonumber(d[4])) then
+        self.log.warn('[CaveBot] bank: transfer requires NPC,targetName,balanceLeft')
         return false
     end
     if retries > 5 then return false end
@@ -2679,7 +3066,11 @@ function CB:_actionBank(value, retries)
     -- transfer: the balance has to be scraped from the NPC's reply first
     self:conversation('hi', 'balance')
     local cb = self
-    local targetName, balanceLeft = d[3], tonumber(d[4]) or 0
+    -- The active GUI draken profile replaces the route target with the logged-in
+    -- character selected by the login window. Keep that behavior when available;
+    -- generic callers still use the route's explicit target name.
+    local targetName = (self.client and self.client.characterName) or d[3]
+    local balanceLeft = tonumber(d[4])
     if self.bot and self.bot.schedule then
         self.bot:schedule(5000, function()
             local bal = cb.bankBalance
@@ -2720,722 +3111,16 @@ end
 --- (bank.lua:87-91: mode 51 containing "Your account balance is").
 function CB:onTalk(data)
     if not data then return end
+    if self.currentAction == 'buysupplies' and self._buySuppliesPending then
+        if self:onBuySuppliesMessage(data) then return end
+    end
+    if data.modeByte ~= 51 and data.mode ~= 'Transaction' then return end
     local text = tostring(data.text or '')
     if text:find('Your account balance is', 1, true) then
-        local n = text:gsub('%.', ''):match('(%d+)')
+        -- GUI vBot's getFirstNumberInText() returns the first digit sequence.
+        local n = text:match('%d+')
         if n then self.bankBalance = tonumber(n) end
     end
-end
-
--- ---------------------------------------------------------------------------
--- withdraw / dpwithdraw / inwithdraw (withdraw.lua, d_withdraw.lua, inbox_withdraw.lua)
--- ---------------------------------------------------------------------------
---- CaveBot.WithdrawItem(id, amount, fromDepot) (new_cavebot_lib.lua:505-537).  Its return
---- value is discarded by both callers (withdraw.lua:46, d_withdraw.lua never calls it at
---- all), so this mirrors it as a void helper.
-function CB:_withdrawItem(id, amount, fromDepot)
-    local have = self.supplies:itemAmount(id)
-    local depot = self:findContainerMatching('depot box') or self:findContainerMatching('your inbox')
-    if not depot then
-        if fromDepot then
-            self:openDepotBox(fromDepot)
-        else
-            self:reachAndOpenInbox()
-        end
-        return
-    end
-    if have >= amount then return end
-
-    local destination
-    for _, c in pairs(self.state.containers or {}) do
-        local n = tostring(c.name or ''):lower()
-        if (tonumber(c.capacity) or 0) > #(c.items or {}) and not n:find('quiver')
-           and not n:find('depot') and not n:find('loot') and not n:find('inbox') then
-            destination = c
-        end
-    end
-    if not destination then return end
-
-    local toMove = amount - have
-    for idx, it in ipairs(depot.items or {}) do
-        if it.id == id then
-            if self.sender then
-                self.sender:move({ x = 0xFFFF, y = 0x40 + depot.id, z = idx - 1 }, it.id, idx - 1,
-                                 CB.slotPosition(destination, #(destination.items or {})),
-                                 min(toMove, it.count or 1))
-            end
-            return
-        end
-    end
-end
-
---- withdraw.lua:5-51 -- "source,id,amount".  A non-numeric source (e.g. "inbox") makes
---- `tonumber` return nil, which is what routes CaveBot.WithdrawItem to the inbox branch
---- instead of a depot box index.
-function CB:_actionWithdraw(value, retries)
-    local d = split(value)
-    if #d ~= 3 then
-        self.log.warn('[CaveBot] withdraw: incorrect data! skipping')
-        return false
-    end
-    local source = tonumber(d[1])
-    local id     = tonumber(d[2])
-    local amount = tonumber(d[3])
-    if not (id and amount) then
-        self.log.warn('[CaveBot] withdraw: incorrect id or amount! skipping')
-        return false
-    end
-
-    local function closeDepotAndLocker()
-        for _, c in pairs(self.state.containers or {}) do
-            local n = tostring(c.name or ''):lower()
-            if (n:find('depot') or n:find('locker')) and self.sender then
-                self.sender:closeContainer(c.id)
-            end
-        end
-    end
-
-    if retries > 100 then
-        self.log.info('[CaveBot] withdraw: actions limit reached, proceeding')
-        closeDepotAndLocker()
-        return true
-    end
-    if self.supplies:itemAmount(id) >= amount then
-        self.log.info('[CaveBot] withdraw: enough items, proceeding')
-        closeDepotAndLocker()
-        return true
-    end
-
-    self.log.info('[CaveBot] withdraw: withdrawing item %s x%s', tostring(id), tostring(amount))
-    self:_withdrawItem(id, amount, source)
-    self:pingDelay()
-    return 'retry'
-end
-
---- d_withdraw.lua:1-93 -- "depotBoxIndex,destContainerName,destItemId[,capLimit]".
-function CB:_actionDpWithdraw(value, retries)
-    if retries > 600 then
-        self.log.info('[CaveBot] dpwithdraw: actions limit reached, proceeding')
-        return false
-    end
-    local d = split(value)
-    if #d ~= 3 and #d ~= 4 then
-        self.log.warn('[CaveBot] dpwithdraw: incorrect value!')
-        return false
-    end
-    local indexDp  = tonumber(d[1])
-    local destName = tostring(d[2]):lower()
-    local destId   = tonumber(d[3])
-    local capLimit = tonumber(d[4])
-    if not (indexDp and destId) then
-        self.log.warn('[CaveBot] dpwithdraw: incorrect value!')
-        return false
-    end
-    self:setDelay(70)
-
-    if self.supplies:freeCap() < (capLimit or 200) then
-        for _, c in pairs(self.state.containers or {}) do
-            local n = tostring(c.name or ''):lower()
-            if (n:find('depot') or n:find('locker')) and self.sender then
-                self.sender:closeContainer(c.id)
-            end
-        end
-        self.log.info('[CaveBot] dpwithdraw: cap limit reached, proceeding')
-        return false
-    end
-
-    local destContainer  = self:getContainerByName(destName)
-    local depotContainer = self:findContainerMatching('depot box')
-
-    if not destContainer then
-        self.log.info('[CaveBot] dpwithdraw: container not found!')
-        return false
-    end
-
-    if self:containerIsFull(destContainer) then
-        for idx, it in ipairs(destContainer.items or {}) do
-            if it.id == destId then
-                if self.sender then
-                    self.sender:openContainer({ x = 0xFFFF, y = 0x40 + destContainer.id, z = idx - 1 },
-                                              it.id, idx - 1, 0)
-                end
-                return 'retry'
-            end
-        end
-    end
-
-    -- stash validation
-    if depotContainer and #(depotContainer.items or {}) == 0 then
-        self.log.info('[CaveBot] dpwithdraw: all items withdrawn')
-        if self.sender then self.sender:closeContainer(depotContainer.id) end
-        return true
-    end
-
-    -- REVIEW: d_withdraw.lua's second "containerIsFull" branch re-tests the identical
-    -- condition handled above and, on a match, calls g_game.open on an undefined local
-    -- (`foundNextContainer`) -- that branch can never be reached with a valid destId match
-    -- (the first branch already returned) so it is dead code and is not reproduced.  The
-    -- "loot containers full!" bail-out that follows it IS live.
-    if self:containerIsFull(destContainer) then
-        self.log.warn('[CaveBot] dpwithdraw: loot containers full!')
-        return false
-    end
-
-    if not self:openDepotBox(indexDp) then
-        return 'retry'
-    end
-    self:pingDelay(2)
-
-    local depotBox = self:findContainerMatching('depot box')
-    if depotBox then
-        local it = (depotBox.items or {})[1]
-        if it then
-            self.log.info('[D_Withdraw] witdhrawing item: %s', tostring(it.id))
-            if self.sender then
-                self.sender:move({ x = 0xFFFF, y = 0x40 + depotBox.id, z = (depotBox.firstIndex or 0) },
-                                 it.id, depotBox.firstIndex or 0,
-                                 CB.slotPosition(destContainer, #(destContainer.items or {})),
-                                 it.count or 1)
-            end
-            return 'retry'
-        end
-    end
-    return 'retry'
-end
-
---- inbox_withdraw.lua:1-80 -- "itemId,amount".
-function CB:_actionInWithdraw(value, retries)
-    local d = split(value)
-    if #d ~= 2 then
-        self.log.warn('[CaveBot] inwithdraw: incorrect withdraw value')
-        return false
-    end
-    local withdrawId = tonumber(d[1])
-    local amount      = tonumber(d[2])
-    if not (withdrawId and amount) then
-        self.log.warn('[CaveBot] inwithdraw: incorrect withdraw value')
-        return false
-    end
-
-    local currentAmount = self.supplies:itemAmount(withdrawId)
-    if currentAmount >= amount then
-        self.log.info('[CaveBot] inwithdraw: enough items, proceeding')
-        return true
-    end
-    if retries > 400 then
-        self.log.info('[CaveBot] inwithdraw: actions limit reached, proceeding')
-        return true
-    end
-
-    self:setDelay(100)
-    local inbox = self:getContainerByName('your inbox')
-    if not inbox then
-        self:reachAndOpenInbox()
-        return 'retry'
-    end
-
-    local inboxAmount = 0
-    for _, it in ipairs(inbox.items or {}) do
-        if it.id == withdrawId then inboxAmount = inboxAmount + (it.count or 1) end
-    end
-    if inboxAmount == 0 then
-        self.log.warn('[CaveBot] inwithdraw: not enough items in inbox container, proceeding')
-        if self.sender then self.sender:closeContainer(inbox.id) end
-        return true
-    end
-
-    local destination
-    for _, c in pairs(self.state.containers or {}) do
-        local n = tostring(c.name or ''):lower()
-        if (tonumber(c.capacity) or 0) > #(c.items or {}) and not n:find('quiver')
-           and not n:find('depot') and not n:find('loot') and not n:find('inbox') then
-            destination = c
-        end
-    end
-    if not destination then
-        self.log.info('[CaveBot] inwithdraw: couldn\'t find proper destination container, skipping')
-        if self.sender then self.sender:closeContainer(inbox.id) end
-        return false
-    end
-
-    self:pingDelay(2)
-    for idx, it in ipairs(inbox.items or {}) do
-        if it.id == withdrawId then
-            local stackable = self:_itemFlag('isStackable', it.id, false)
-            local moveCount = stackable and min(it.count or 1, amount - currentAmount) or 1
-            if self.sender then
-                self.sender:move({ x = 0xFFFF, y = 0x40 + inbox.id, z = idx - 1 }, it.id, idx - 1,
-                                 CB.slotPosition(destination, #(destination.items or {})), moveCount)
-            end
-            return 'retry'
-        end
-    end
-    return 'retry'
-end
-
--- ---------------------------------------------------------------------------
--- imbuing (imbuing.lua) -- the CAVEBOT ACTION half only.  The real script's editor GUI
--- (per-item slot picker window) has no luaclient equivalent; the config it would have
--- produced is read straight from `bot.storage.autoImbue` in the SAME shape
--- (`{ useProtection=, items = { [itemIdStr] = { minSeconds=, slotPicks = { [slotIdxStr] =
--- {id=|name=,base=,tier=} } } } }`), so anything that writes that table -- a future panel
--- page, or a hand-edited storage.lua -- drives this unchanged.
--- ---------------------------------------------------------------------------
-function CB:_imbuingReset() self._imbuRun = nil end
-
---- ImbuTrackerCache lookup (imbuing.lua:152-172), read straight off proto/parser.lua's
---- `state.imbuementTracker` (0x5D) instead of a locally kept cache -- one fewer place for
---- the two to drift apart.
-function CB:_imbuTrackerFor(itemId)
-    local list = self.state.imbuementTracker
-    if type(list) ~= 'table' then return nil end
-    for i = 1, #list do
-        local entry = list[i]
-        local it = entry and entry.item
-        if it and it.id == itemId then return entry end
-    end
-    return nil
-end
-
---- trackerNeeds (imbuing.lua:410-419).
-function CB:_imbuTrackerNeeds(icfg, itemId)
-    local tc = self:_imbuTrackerFor(itemId)
-    if not tc then return false, false end
-    for slotStr, pick in pairs(icfg.slotPicks or {}) do
-        local slot = tc.slots and tc.slots[tonumber(slotStr)]
-        if not slot then return true, true end
-        if (slot.duration or 0) < (icfg.minSeconds or 0) then return true, true end
-        if pick.name and not self:_imbuPickMatchesLoose(pick, slot.name) then return true, true end
-    end
-    return false, true
-end
-
---- pickMatches (imbuing.lua:378-389) -- exact id, exact name, or base+tier.
-function CB:_imbuPickMatches(pick, activeName, activeId, activeGroup)
-    if pick.id and activeId and pick.id == activeId then return true end
-    if pick.name and activeName then
-        local an = tostring(activeName):lower()
-        if tostring(pick.name):lower() == an then return true end
-        if pick.base and an:find(tostring(pick.base):lower(), 1, true) then
-            if not pick.tier then return true end
-            if activeGroup and tostring(activeGroup):lower() == tostring(pick.tier):lower() then
-                return true
-            end
-            if an:find(tostring(pick.tier):lower(), 1, true) then return true end
-        end
-    end
-    return false
-end
-
---- pickMatchesLoose (imbuing.lua:392-398) -- name-only, used against tracker data.
-function CB:_imbuPickMatchesLoose(pick, activeName)
-    if not (pick and activeName) then return false end
-    local an = tostring(activeName):lower()
-    if pick.name and tostring(pick.name):lower() == an then return true end
-    if pick.base and an:find(tostring(pick.base):lower(), 1, true) then return true end
-    return false
-end
-
-function CB:_actionImbuing(value, retries)
-    if tostring(value) ~= 'config' then
-        self:_warnOnce('imbuing:legacy',
-            "CaveBot[Imbuing]: old waypoint format ('" .. tostring(value) ..
-            "') is not supported by this client; re-add the waypoint")
-        return false
-    end
-
-    local st  = self.bot and self.bot.storage
-    local cfg = st and st.autoImbue
-    if type(cfg) ~= 'table' or type(cfg.items) ~= 'table' then
-        self:_warnOnce('imbuing:noconfig',
-            '[CaveBot] imbuing: storage.autoImbue is not configured, nothing to do')
-        return false
-    end
-
-    local api = self.bot and self.bot.api
-    local work = {}
-    for idStr, icfg in pairs(cfg.items) do
-        if type(icfg) == 'table' and next(icfg.slotPicks or {}) ~= nil then
-            local id = tonumber(idStr)
-            local it = id and api and api.findItem and api.findItem(id) or nil
-            if it then
-                work[#work + 1] = { id = id, icfg = icfg, it = it }
-            else
-                self.log.warn('[CaveBot] imbuing: item %s not found, skipping', tostring(id))
-            end
-        end
-    end
-    if #work == 0 then
-        self.log.info('[CaveBot] imbuing: nothing configured, proceeding')
-        self:_imbuingReset()
-        return true
-    end
-
-    local run = self._imbuRun
-    if retries == 0 or not run then
-        run = { doneItems = {}, opsAt = 0, usedShrineAt = 0, usedWindowRef = nil }
-        self._imbuRun = run
-        -- EquipManager.setOff()/setOn() (equipment-swap suppression while imbuing) has no
-        -- luaclient equivalent -- there is no client-side equip-manager module here; see
-        -- the coverage report.
-    end
-    if retries > 150 then
-        self.log.warn('[CaveBot] imbuing: too many tries, giving up')
-        if self.sender then self.sender:closeImbuingWindow() end
-        self:_imbuingReset()
-        return false
-    end
-
-    local current
-    for i = 1, #work do
-        local w = work[i]
-        if not run.doneItems[w.id] then
-            local needs, known = self:_imbuTrackerNeeds(w.icfg, w.id)
-            if known and not needs then
-                run.doneItems[w.id] = true
-            else
-                current = w
-                break
-            end
-        end
-    end
-    if not current then
-        self.log.info('[CaveBot] imbuing: all imbuements fresh, proceeding')
-        if self.sender then self.sender:closeImbuingWindow() end
-        self:_imbuingReset()
-        return true
-    end
-
-    local pp = self.state.player and self.state.player.pos
-    if not pp then return 'retry' end
-    local shrine, shrineTile
-    for _, tile in ipairs(self:tilesOnFloor(pp.z)) do
-        for _, t in ipairs(tile.things or {}) do
-            if t.kind == 'item' and worldmod.idListHas(cavebot.IMBUING_SHRINES, t.id) then
-                shrine, shrineTile = t, tile
-                break
-            end
-        end
-        if shrine then break end
-    end
-    if not shrine then
-        self.log.warn('[CaveBot] imbuing: no imbuing shrine in sight, skipping')
-        self:_imbuingReset()
-        return false
-    end
-    local dest = shrineTile.pos
-
-    if not self:matchPosition(dest, 1) then
-        self:goTo(dest, 1)
-        self:delay(300)
-        return 'retry'
-    end
-
-    local now = self.now()
-    local win = self.state.imbuementWindow
-
-    -- operate on fresh window data for the current item
-    if win and win.itemId == current.it.id and win ~= run.usedWindowRef then
-        if now - run.opsAt < 700 then self:delay(200); return 'retry' end
-        for slotStr, pick in pairs(current.icfg.slotPicks or {}) do
-            local slotIndex = tonumber(slotStr)
-            if slotIndex ~= nil and slotIndex < (win.slots or 0) then
-                local tup = win.activeSlots and win.activeSlots[slotIndex]
-                local active = tup and tup[1]
-                local duration = tup and tup[2] or 0
-                local hasActive = active and active.id and active.id ~= 0
-                local wrongType = hasActive and pick.name
-                                  and not self:_imbuPickMatches(pick, active.name, active.id, active.group)
-                local tooLow = hasActive and duration < (current.icfg.minSeconds or 0)
-                if hasActive and (tooLow or wrongType) then
-                    self.log.info('[CaveBot] imbuing: clearing slot %d of item %s%s',
-                                  slotIndex, tostring(current.id),
-                                  wrongType and ' (wrong imbuement)' or ' (low duration)')
-                    if self.sender then self.sender:clearImbuement(slotIndex) end
-                    run.opsAt = now
-                    self:delay(700)
-                    return 'retry'
-                end
-                if not hasActive then
-                    local target
-                    for _, a in ipairs(win.imbuements or {}) do
-                        if self:_imbuPickMatches(pick, a.name, a.id, a.group) then
-                            target = a
-                            break
-                        end
-                    end
-                    if target then
-                        self.log.info('[CaveBot] imbuing: applying %s to slot %d of item %s',
-                                      tostring(target.name or target.id), slotIndex, tostring(current.id))
-                        if self.sender then
-                            self.sender:applyImbuement(slotIndex, target.id,
-                                                       cfg.useProtection and true or false)
-                        end
-                        run.opsAt = now
-                        self:delay(900)
-                        return 'retry'
-                    else
-                        self.log.warn('[CaveBot] imbuing: %s not offered for item %s, skipping slot %d',
-                                      tostring(pick.name or pick.id), tostring(current.id), slotIndex)
-                    end
-                end
-            end
-        end
-        run.doneItems[current.id] = true
-        if self.sender then self.sender:closeImbuingWindow() end
-        run.usedWindowRef  = win
-        run.usedShrineAt   = now
-        self:delay(600)
-        return 'retry'
-    end
-
-    -- window open for a different item (or none of ours yet): select ours
-    if win and win.itemId ~= current.it.id and win ~= run.usedWindowRef then
-        if now - run.opsAt >= 800 then
-            self.log.info('[CaveBot] imbuing: selecting item %s in the imbuement window',
-                          tostring(current.id))
-            if self.sender then
-                self.sender:imbuementWindowAction(1, current.it.id,
-                                                  current.it.pos or dest, current.it.stackPos or 0)
-            end
-            run.opsAt = now
-        end
-        self:delay(400)
-        return 'retry'
-    end
-
-    -- nothing usable open yet: use the shrine
-    if now - run.usedShrineAt >= 2000 then
-        run.usedShrineAt  = now
-        run.usedWindowRef = nil
-        if self.sender then
-            self.sender:use(dest, shrine.id or 0, self:_stackPosOf(shrineTile, shrine), 0)
-        end
-    end
-    self:delay(500)
-    return 'retry'
-end
-
--- ---------------------------------------------------------------------------
--- rushlure / stand lure (stand_lure.lua)
--- ---------------------------------------------------------------------------
---- reset(delay) (stand_lure.lua:32-40).  VERIFIER: `delay = delay or 0` runs BEFORE the
---- `if delay == nil` check, so that check can never see nil -- the "enable = nil" branch is
---- dead code in the real script and is not reproduced.
-function CB:_rushLureReset(delayMs)
-    local sup = self.supplies
-    if sup and sup.hasEnough and type(sup:hasEnough()) == 'table' then return end
-    self:delay(delayMs or 0)
-end
-
-function CB:_actionRushLure(value, retries)
-    local d = split(value)
-    if not d[1] then
-        self.log.warn('[CaveBot] Invalid cavebot lure action value. It should be '
-                      .. 'position (x,y,z), delay(ms) is: %s', tostring(value))
-        return false
-    end
-    local pos = { x = tonumber(d[1]), y = tonumber(d[2]), z = tonumber(d[3]) }
-    local delayTime = tonumber(d[4]) or 1000
-    local enable
-    if not d[5] then enable = nil
-    elseif d[5] == 'yes' then enable = true
-    else enable = false end
-
-    local sup = self.supplies
-    if sup and sup.hasEnough and type(sup:hasEnough()) == 'table' then return false end
-
-    self:delay(100)
-
-    if retries > 50 and not self._rushLureResetRetries then
-        self:_rushLureReset()
-        self.log.warn("[CaveBot] [Rush Lure] Too many tries, can't reach position")
-        return false
-    end
-    if self._rushLureResetRetries then self._rushLureResetRetries = false end
-
-    local pp = self.state.player and self.state.player.pos
-    if not pp then return false end
-    if cheb(pp, pos) > 30 then
-        self:_rushLureReset()
-        return false
-    end
-
-    local pathWithoutMonsters = self.path:getPath(pp, pos, 30,
-                                                  { ignoreNonPathable = true, ignoreCreatures = true,
-                                                    precision = 0 })
-    local pathWithMonsters = self.path:getPath(pp, pos, 30,
-                                               { ignoreNonPathable = true, ignoreCreatures = false,
-                                                 precision = 0 })
-
-    if not pathWithoutMonsters then
-        self:_rushLureReset()
-        self.log.warn('[CaveBot] [Rush Lure] No possible path to reach position, skipping.')
-        return false
-    elseif not pathWithMonsters then
-        local np = { x = pp.x, y = pp.y, z = pp.z }
-        for i = 1, #pathWithoutMonsters do
-            local dd = DELTA[pathWithoutMonsters[i]]
-            if not dd then break end
-            np.x, np.y = np.x + dd[1], np.y + dd[2]
-            local tile = self.state:tile(np)
-            local c = tile and self:_firstCreatureOn(tile)
-            if c and c.isMonster and (c.healthPercent or 0) > 0 and (c.type or 0) < 3 then
-                local reach = self.path:getPath(pp, c.pos, 7,
-                                                { ignoreNonPathable = true, precision = 1 })
-                if reach then
-                    if self.sender then
-                        self.sender:attack(c.id)
-                        self:_chaseKeepingModes()
-                    end
-                    self._rushLureResetRetries = true
-                    self:delay(100)
-                    return 'retry'
-                end
-            end
-        end
-        if not (self.bot and self.bot._attacking) then
-            self:_rushLureReset()
-            self.log.warn('[CaveBot] [Rush Lure] No path, no blocking monster, skipping.')
-            return false
-        end
-    end
-
-    if not self:matchPosition(pos, 0) then
-        local tb = self.bot and self.bot.modules and self.bot.modules.targetbot
-        if tb and tb.delay then tb:delay(300) end
-        self:walkTo(pos, 30, { ignoreCreatures = false, ignoreNonPathable = true, precision = 0 })
-        self:delay(100)
-        self._rushLureResetRetries = true
-        return 'retry'
-    end
-
-    local tb = self.bot and self.bot.modules and self.bot.modules.targetbot
-    local function setTB(on)
-        if not tb then return end
-        if on and tb.setOn then tb:setOn() elseif tb.setOff then tb:setOff() end
-    end
-    setTB(true)
-    -- REVIEW: upstream defers `enable` to the NEXT waypoint's onChildFocusChange (a widget
-    -- event this headless client has no equivalent of); applying it immediately here has
-    -- the same net effect one tick earlier.
-    if enable == true then setTB(true) elseif enable == false then setTB(false) end
-    self:_rushLureReset(delayTime)
-    return true
-end
-
--- ---------------------------------------------------------------------------
--- tasker (tasker.lua)
--- ---------------------------------------------------------------------------
---- Loot-of-monster counter (tasker.lua:151-164).  regexMatch() is ECMAScript via the C++
---- client and has no luaclient equivalent; a Lua pattern that extracts the same monster
---- name from either message shape ("Loot of a rat:" / "Loot of Draken Warmaster:") stands
---- in for it.
-function CB:onTaskerLoot(d)
-    local text = type(d) == 'table' and d.text or d
-    text = tostring(text or '')
-    if not text:lower():find('loot of', 1, true) then return end
-    local t = self.bot and self.bot.storage and self.bot.storage.caveBotTasker
-    if not t or not t.inProgress then return end
-    local phrase = text:match('[Ll]oot of%s+(.-)%s*:')
-    if not phrase then return end
-    phrase = phrase:lower():gsub('^a%s+', ''):gsub('^an%s+', ''):gsub('^the%s+', '')
-    if phrase == t.monster or (t.monster2 and t.monster2 ~= '' and phrase == t.monster2) then
-        t.count = (t.count or 0) + 1
-    end
-end
-
---- tasker.lua:1-135.  VERIFIER: `dataValidationFailed()` only prints and returns a value
---- the real script's caller discards -- it does NOT stop execution.  An invalid waypoint
---- still falls into the marker dispatch below with whatever locals happen to be set
---- (usually blank/zero).  Reproduced verbatim; a marker outside {1,2,3} (or a non-numeric
---- one) matches nothing in either branch and the action returns nil, exactly like the real
---- script's implicit fall-through (nil advances the waypoint like any other result the
---- dispatcher doesn't recognise -- see cavebot.lua:851-862).
-function CB:_actionTasker(value, retries)
-    local d = split(value)
-    local st = self.bot and self.bot.storage
-    if not st then return false end
-    st.caveBotTasker = st.caveBotTasker or
-        { inProgress = false, monster = '', monster2 = '', taskName = '', count = 0, max = 0 }
-    local t = st.caveBotTasker
-    local marker = tonumber(d[1])
-
-    local function resetTaskData()
-        t.inProgress, t.monster, t.monster2 = false, '', ''
-        t.taskName, t.count, t.max = '', 0, 0
-    end
-    local function fail()
-        self.log.info('[CaveBot] tasker: data validation failed! incorrect data, check '
-                      .. 'cavebot/tasker for more info')
-    end
-
-    local taskName, monster, monster2, count = '', '', '', 0
-    local label1, label2 = '', ''
-
-    if marker == nil then
-        fail()
-        resetTaskData()
-    elseif marker == 1 then
-        if #self.world:npcs(self.state.player and self.state.player.pos, 3) == 0 then
-            self.log.info('[CaveBot] tasker: no NPC found in range! skipping')
-            return false
-        end
-        if #d ~= 4 and #d ~= 5 then
-            fail()
-            resetTaskData()
-        else
-            taskName = tostring(d[2]):lower()
-            count    = tonumber(d[3]) or 0
-            monster  = tostring(d[4]):lower()
-            if d[5] then monster2 = tostring(d[5]):lower() end
-        end
-    elseif marker == 2 then
-        if #d ~= 3 then
-            fail()
-        else
-            label1, label2 = tostring(d[2]):lower(), tostring(d[3]):lower()
-        end
-    elseif marker == 3 then
-        if #self.world:npcs(self.state.player and self.state.player.pos, 3) == 0 then
-            self.log.info('[CaveBot] tasker: no NPC found in range! skipping')
-            return false
-        end
-        if #d ~= 1 then fail() end
-    end
-
-    -- "let's cover markers now" (tasker.lua:83) -- unconditional, per the VERIFIER above.
-    if marker == 1 then
-        self:conversation('hi', 'task', taskName, 'yes')
-        self:delay(self:talkDelay() * 4)
-        t.monster, t.taskName, t.inProgress = monster, taskName, true
-        if monster2 ~= '' then t.monster2 = monster2 end
-        t.max, t.count = count, 0
-        self.log.info('[CaveBot] tasker: taken task for: %s x%s', monster, tostring(count))
-        return true
-    elseif marker == 2 then
-        if not t.inProgress then
-            self:gotoLabel(label2)
-            self.log.info('[CaveBot] tasker: there is no task in progress so going to take one.')
-            return true
-        end
-        if t.count >= t.max then
-            self:gotoLabel(label2)
-            self.log.info('[CaveBot] tasker: task completed: %s', tostring(t.taskName))
-        else
-            self:gotoLabel(label1)
-            self.log.info('[CaveBot] tasker: task in progress, left: %s %s',
-                          tostring(t.max - t.count), tostring(t.taskName))
-        end
-        return true
-    elseif marker == 3 then
-        self:conversation('hi', 'report', 'task')
-        self:delay(self:talkDelay() * 3)
-        resetTaskData()
-        self.log.info('[CaveBot] tasker: task reported, done')
-        return true
-    end
-    -- marker not in {1,2,3}: matches the real script's implicit `nil` return.
 end
 
 -- ===========================================================================
