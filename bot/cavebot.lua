@@ -1355,11 +1355,27 @@ local function trackerPickMatches(pick, activeName)
     return pick.base and name:find(tostring(pick.base):lower(), 1, true) ~= nil
 end
 
+local function formatImbuementIds(ids)
+    return #ids > 0 and table.concat(ids, ',') or 'none'
+end
+
+local function formatImbuements(imbuements)
+    local names = {}
+    for _, imbuement in ipairs(imbuements or {}) do
+        names[#names + 1] = tostring(imbuement.name or imbuement.id or '?')
+    end
+    table.sort(names)
+    return #names > 0 and table.concat(names, '|') or 'none'
+end
+
 function CB:_imbuementWork()
     local storage = self.bot and self.bot.storage
     local config = storage and storage.autoImbue
     local items = config and config.items
-    if type(items) ~= 'table' then return {}, config end
+    if type(items) ~= 'table' then
+        self:_imbuementInfo('work:none', '[CaveBot] imbuing work: no configured items')
+        return {}, config
+    end
 
     local ids = {}
     for id in pairs(items) do
@@ -1369,18 +1385,41 @@ function CB:_imbuementWork()
     table.sort(ids, function(a, b) return a < b end)
 
     local work = {}
+    local configuredIds, availableIds, unavailableIds = {}, {}, {}
     for _, id in ipairs(ids) do
         local itemConfig = items[tostring(id)] or items[id]
+        local hasSlotPicks = false
         if type(itemConfig) == 'table' and type(itemConfig.slotPicks) == 'table' then
+            for _ in pairs(itemConfig.slotPicks) do
+                hasSlotPicks = true
+                break
+            end
+        end
+        if hasSlotPicks then
+            configuredIds[#configuredIds + 1] = tostring(id)
             local item = self.bot.api and self.bot.api.findItem(id)
             if item then
+                availableIds[#availableIds + 1] = tostring(id)
                 work[#work + 1] = { id = id, config = itemConfig, item = item }
             else
+                unavailableIds[#unavailableIds + 1] = tostring(id)
                 self.log.warn('[CaveBot] imbuing item %s is not available', tostring(id))
             end
         end
     end
+    self:_imbuementInfo('work:' .. formatImbuementIds(configuredIds) .. ':'
+        .. formatImbuementIds(availableIds) .. ':' .. formatImbuementIds(unavailableIds),
+        '[CaveBot] imbuing work: configured=%s available=%s unavailable=%s',
+        formatImbuementIds(configuredIds), formatImbuementIds(availableIds),
+        formatImbuementIds(unavailableIds))
     return work, config
+end
+
+function CB:_imbuementInfo(key, message, ...)
+    self._imbueInfoKeys = self._imbueInfoKeys or {}
+    if self._imbueInfoKeys[key] then return end
+    self._imbueInfoKeys[key] = true
+    self.log.info(message, ...)
 end
 
 function CB:_imbuementTrackerItem(itemId)
@@ -1417,11 +1456,17 @@ end
 
 function CB:_actionImbuing(value, retries)
     if tostring(value) ~= 'config' then return false end
+    if retries == 0 then self._imbueInfoKeys = {} end
     local work, config = self:_imbuementWork()
-    if #work == 0 then return true end
+    if #work == 0 then
+        self:_imbuementInfo('skip:no-work', '[CaveBot] imbuing skipped: no available configured items')
+        return true
+    end
 
     if retries == 0 or not self._imbueRun then
-        self._imbueRun = { done = {}, lastOp = -math.huge, shrineAt = -math.huge }
+        local choice = self.state.imbuementWindowChoice
+        self._imbueRun = { done = {}, lastOp = -math.huge, shrineAt = -math.huge,
+                           choiceSerial = choice and choice.serial or nil }
         if self.sender then self.sender:imbuementDurations(true) end
     end
     local run = self._imbueRun
@@ -1436,10 +1481,14 @@ function CB:_actionImbuing(value, retries)
     for _, entry in ipairs(work) do
         if not run.done[entry.id] then
             local needs, known = self:_imbuementNeeds(entry.config, entry.id)
+            self:_imbuementInfo('item:' .. tostring(entry.id) .. ':' .. tostring(known) .. ':' .. tostring(needs),
+                '[CaveBot] imbuing item=%s tracker=%s needs=%s', tostring(entry.id),
+                tostring(known), tostring(needs))
             if known and not needs then run.done[entry.id] = true else current = entry; break end
         end
     end
     if not current then
+        self:_imbuementInfo('complete', '[CaveBot] imbuing complete: all configured items are fresh')
         if self.sender then self.sender:closeImbuingWindow() end
         self._imbueRun = nil
         return true
@@ -1447,17 +1496,39 @@ function CB:_actionImbuing(value, retries)
 
     local shrine = self:_imbuementShrine()
     if not shrine then
+        self:_imbuementInfo('shrine:none', '[CaveBot] imbuing blocked: shrine not found on floor %s',
+            tostring(self.state.player and self.state.player.pos and self.state.player.pos.z))
         self.log.warn('[CaveBot] imbuing shrine not found on the current floor')
         self._imbueRun = nil
         return false
     end
     if not self:matchPosition(shrine.pos, 1) then
+        self:_imbuementInfo('shrine:move:' .. tostring(current.id),
+            '[CaveBot] imbuing moving to shrine at %s,%s,%s for item=%s',
+            tostring(shrine.pos.x), tostring(shrine.pos.y), tostring(shrine.pos.z), tostring(current.id))
         self:preciseGoTo(shrine.pos, 1)
+        return 'retry'
+    end
+
+    local choice = self.state.imbuementWindowChoice
+    if choice then
+        if run.choiceSerial ~= choice.serial then
+            self.log.info('[CaveBot] imbuing selecting item=%s after shrine choice serial=%s',
+                tostring(current.id), tostring(choice.serial))
+            self.sender:imbuementWindowAction(1, current.id, current.item.pos,
+                                              current.item.stackPos or 0)
+            run.choiceSerial = choice.serial
+            run.lastOp = now
+        end
+        self:delay(400)
         return 'retry'
     end
 
     local window = self.state.imbuementWindow
     if window and tonumber(window.itemId) == tonumber(current.id) then
+        self:_imbuementInfo('window:' .. tostring(current.id) .. ':' .. tostring(window.slots),
+            '[CaveBot] imbuing window item=%s slots=%s offered=%s', tostring(current.id),
+            tostring(window.slots), formatImbuements(window.imbuements))
         if now - run.lastOp < 700 then self:delay(200); return 'retry' end
         local minimum = tonumber(current.config.minSeconds) or 3600
         for slotString, pick in pairs(current.config.slotPicks) do
@@ -1469,6 +1540,9 @@ function CB:_actionImbuing(value, retries)
                 local wrong = hasActive and not imbuementPickMatches(pick, imbuement)
                 local tooLow = hasActive and (tonumber(active[2]) or 0) < minimum
                 if hasActive and (wrong or tooLow) then
+                    self:_imbuementInfo('clear:' .. tostring(current.id) .. ':' .. tostring(slot),
+                        '[CaveBot] imbuing clear item=%s slot=%s reason=%s', tostring(current.id),
+                        tostring(slot), wrong and 'wrong' or 'expired')
                     self.sender:clearImbuement(slot)
                     run.lastOp = now
                     self:delay(700)
@@ -1479,10 +1553,18 @@ function CB:_actionImbuing(value, retries)
                         if imbuementPickMatches(pick, offered) then target = offered; break end
                     end
                     if target then
+                        self.log.info('[CaveBot] imbuing apply item=%s slot=%s imbuement=%s (%s)',
+                            tostring(current.id), tostring(slot), tostring(target.id),
+                            tostring(target.name or '?'))
                         self.sender:applyImbuement(slot, target.id, config and config.useProtection)
                         run.lastOp = now
                         self:delay(900)
                         return 'retry'
+                    else
+                        self:_imbuementInfo('offer:none:' .. tostring(current.id) .. ':' .. tostring(slot),
+                            '[CaveBot] imbuing blocked: item=%s slot=%s target=%s not offered; offered=%s',
+                            tostring(current.id), tostring(slot), tostring(pick.name or pick.id or '?'),
+                            formatImbuements(window.imbuements))
                     end
                 end
             end
@@ -1496,6 +1578,8 @@ function CB:_actionImbuing(value, retries)
     end
 
     if window and now - run.lastOp >= 800 then
+        self:_imbuementInfo('select:' .. tostring(current.id),
+            '[CaveBot] imbuing selecting item=%s in existing window', tostring(current.id))
         self.sender:imbuementWindowAction(1, current.id, current.item.pos, current.item.stackPos or 0)
         run.lastOp = now
         self:delay(400)
@@ -1504,6 +1588,9 @@ function CB:_actionImbuing(value, retries)
 
     if now - run.shrineAt >= 2000 then
         self.state.imbuementWindow = nil
+        self.log.info('[CaveBot] imbuing shrine use item=%s shrine=%s at=%s,%s,%s',
+            tostring(current.id), tostring(shrine.id), tostring(shrine.pos.x),
+            tostring(shrine.pos.y), tostring(shrine.pos.z))
         self.sender:use(shrine.pos, shrine.id, shrine.stackPos, 0)
         run.shrineAt = now
     end
