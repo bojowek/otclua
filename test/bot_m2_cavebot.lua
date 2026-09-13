@@ -918,8 +918,14 @@ do
     H.cb:enable()
 
     H.cb:tick()
-    eq(H.cb.index, 1, 'the NPC is 3 sqm away: reachNPC is satisfied, but no trade window yet')
+    eq(H.cb.index, 1, 'the NPC is 3 sqm away: buysupplies keeps walking instead of greeting')
     local talks = H.ops('talk')
+    eq(#talks, 0, 'it does not greet while another NPC could also hear the message')
+
+    H.moveTo(F.at(2, 0))
+    H.clock.t = H.cb.readyAt
+    H.cb:tick()
+    talks = H.ops('talk')
     eq(talks[1].text, 'hi', 'it greets the NPC')
     eq(talks[1].mode, 11, 'on the NPC channel')
     eq(H.cb.retries, 1, 'and retries')
@@ -954,6 +960,45 @@ do
         config = { stayPathEnabled = false, antiLostEnabled = false } } })
     H2.cb:enable(); H2.cb:tick()
     eq(H2.cb.index, 2, 'a missing NPC skips the waypoint')
+
+    -- A rejected purchase is terminal for this waypoint; do not retry it forever.
+    local M = newWorld({ '@..N' }, { npcName = 'Topsy' })
+    local H3 = newHarness(M, { route = { waypoints = {
+        { action = 'buysupplies', value = 'Topsy' },
+        { action = 'label', value = 'after-money-failure' },
+    }, config = { stayPathEnabled = false, antiLostEnabled = false } } })
+    H3.cb.supplies:reload({ supplies = {
+        currentProfile = 'test',
+        test = { items = { ['3097'] = { min = 0, max = 5 } } },
+    } })
+    H3.cb:enable(); H3.cb:tick()
+    M.st.npcTrade = { open = true, items = { { id = 3097 } } }
+    H3.clock.t = H3.cb.readyAt
+    H3.cb:tick()
+    H3.bus:emit('textMessage', { text = "You don't have enough money." })
+    H3.clock.t = H3.cb.readyAt + 10
+    H3.cb:tick()
+    eq(H3.cb.index, 2, 'not enough money skips the buysupplies waypoint')
+
+    -- Capacity failures are terminal too: the headless client has no UI prompt to
+    -- dismiss, so the text-message event must let the waypoint advance explicitly.
+    local C = newWorld({ '@..N' }, { npcName = 'Topsy' })
+    local H4 = newHarness(C, { route = { waypoints = {
+        { action = 'buysupplies', value = 'Topsy' },
+        { action = 'label', value = 'after-capacity-failure' },
+    }, config = { stayPathEnabled = false, antiLostEnabled = false } } })
+    H4.cb.supplies:reload({ supplies = {
+        currentProfile = 'test',
+        test = { items = { ['3097'] = { min = 0, max = 5 } } },
+    } })
+    H4.cb:enable(); H4.cb:tick()
+    C.st.npcTrade = { open = true, items = { { id = 3097 } } }
+    H4.clock.t = H4.cb.readyAt
+    H4.cb:tick()
+    H4.bus:emit('textMessage', { mode = 0x06, text = 'You do not have enough capacity.' })
+    H4.clock.t = H4.cb.readyAt + 10
+    H4.cb:tick()
+    eq(H4.cb.index, 2, 'not enough capacity skips the buysupplies waypoint')
 end
 
 -- ============================================================================

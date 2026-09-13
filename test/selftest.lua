@@ -697,6 +697,41 @@ runSuite('proto.parser', function()
     check(evNamed('walkCancel') ~= nil or evNamed('ping') ~= nil, '0xB5 parsed')
     check(evNamed('ping') ~= nil, '0xB5 consumed exactly its own bytes')
 
+    -- Daily reward packets retain their data for headless callers.
+    w = buffer.writer(); w:u8(0xDE):u8(1)
+    parse(w:data() .. PING)
+    eq(st.dailyReward.collectionState, 1, '0xDE stores collection state')
+    check(evNamed('dailyRewardCollectionState') ~= nil, '0xDE emits collection state')
+
+    w = buffer.writer(); w:u8(0xE2):u8(0):u32(123456):u8(3):u8(0):u8(1):u16(7):u16(2)
+    parse(w:data() .. PING)
+    local wall = evNamed('rewardWall')
+    if check(wall ~= nil, '0xE2 emits reward wall') then
+        eq(wall.nextRewardTime, 123456, '0xE2 next reward time')
+        eq(wall.timeLeft, 0, '0xE2 Gunz flag omits time-left field')
+        eq(st.dailyReward.wall.tokens, 7, '0xE2 tokens')
+    end
+    check(evNamed('ping') ~= nil, '0xE2 consumed exactly its own bytes')
+
+    w = buffer.writer(); w:u8(0xE4):u8(1)
+    w:u8(1):u8(2):u8(1):u16(3031):string('Gold'):u32(5)
+    w:u8(2):u8(2):u8(1):u16(3043):string('Rune'):u8(1):u8(2):u8(3)
+    w:u8(1):string('Shrine'):u8(9):u8(7)
+    parse(w:data() .. PING)
+    local reward = evNamed('dailyReward')
+    if check(reward ~= nil, '0xE4 emits daily reward data') then
+        eq(reward.days, 1, '0xE4 day count')
+        eq(reward.freeRewards[1].selectableItems[1].itemId, 3031, '0xE4 selectable item')
+        eq(reward.premiumRewards[1].bundleItems[2].count, 3, '0xE4 wildcard bundle')
+        eq(st.dailyReward.data.bonuses[1].id, 9, '0xE4 bonus')
+    end
+    check(evNamed('ping') ~= nil, '0xE4 consumed exactly its own bytes')
+
+    w = buffer.writer(); w:u8(0xE5):u8(1):u32(42):u8(1):string('claimed'):u16(4)
+    parse(w:data() .. PING)
+    eq(st.dailyReward.history[1].description, 'claimed', '0xE5 stores reward history')
+    check(evNamed('ping') ~= nil, '0xE5 consumed exactly its own bytes')
+
     -- multiple opcodes packed into one message
     w = buffer.writer()
     w:u8(0x1D); w:u8(0x1E); w:u8(0xB5):u8(1); w:u8(0x1D)
@@ -742,6 +777,11 @@ runSuite('proto.sender', function()
        'extendedOpcode 10 writes [0x32][10][u16 len + text]')
     s:attack(0x11223344)
     check(#sent > 0 and sent[#sent]:byte(1) == 0xA1, 'attack writes opcode 161')
+    s:sendOpenRewardWall()
+    eq(tohex(sent[#sent]), 'd8', 'sendOpenRewardWall writes opcode 216')
+    s:sendGetRewardDaily(0, { [3031] = 2, [3043] = 1 })
+    eq(tohex(sent[#sent]), 'da0002d70b02e30b01',
+       'sendGetRewardDaily writes shrine flag and sorted item pairs')
 end)
 
 -- ================================================== lib.socket + lib.sched
@@ -1438,6 +1478,14 @@ runSuite('fixes: proto.sender', function()
     eq(tohex(sent[#sent]), '7bd70b00050001', '0x7B sell: u16 id, u8 sub, u16 amount, u8 flag')
     s:closeNpcTrade()
     eq(tohex(sent[#sent]), '7c', '0x7C close npc trade is empty')
+    sent = {}
+    s:quickLootBlackWhitelist(1, { 3031, 3577 })
+    eq(tohex(sent[#sent]), '91010200d70bf90d',
+       '0x91 accept-only: filter=1, size=2, gold 3031 then meat 3577')
+    sent = {}
+    s:quickLootBlackWhitelist(0, {})
+    eq(tohex(sent[#sent]), '91000000',
+       '0x91 skip-list replace: filter=0, empty size')
     s:requestOutfit()
     eq(tohex(sent[#sent]), 'd2', '0xD2 request outfit is empty')
     s:changeOutfit{ id = 128, head = 1, body = 2, legs = 3, feet = 4, addons = 3,

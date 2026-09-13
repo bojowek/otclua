@@ -1136,9 +1136,10 @@ do
     eq(tb.loot:process(0, 0), false, 'a full loot bag with no spare -> not looting')
     eq(tb.loot:getStatus(), 'No space', 'status No space')
 
-    -- (d) nothing configured at all
+    -- (d) no destination configured: the omitted mode still defaults to all-item looting
     tb.loot:update({ items = {}, containers = {} })
-    eq(tb.loot:process(0, 0), false, 'no items and no everyItem -> not looting')
+    eq(tb.loot:everyItem(), true, 'an empty omitted item list defaults to every-item mode')
+    eq(tb.loot:process(0, 0), false, 'without a loot bag -> not looting')
     eq(tb.loot:getStatus(), '', 'status ""')
 end
 
@@ -1191,7 +1192,7 @@ do
 end
 
 -- ============================================================================
-S('looting: food is eaten at most once per 5 s, and only when nothing is loot')
+S('looting: configured whitelist ignores food instead of consuming it')
 do
     local tb, host, st, start = lootHost{ storage = { foodItems = { { id = 3582, count = 1 } } } }
     addContainer(st, 0, 2854, {})
@@ -1203,23 +1204,9 @@ do
     tb.sender:clear()
     tb.loot:process(0, 0)
     local u = tb.sender:byKind('use')
-    eq(#u, 1, 'the ham is eaten')
-    eq(u[1].id, 3582, 'item 3582')
-    eq(u[1].pos.y, 0x40 + 1, 'from the corpse container')
-
-    tb.sender:clear()
-    tb.loot:process(0, 0)
-    eq(#tb.sender:byKind('use'), 0, 'not again inside the 5 s interval')
-    eq(#tb.sender:byKind('close'), 1,
-       'and with nothing else to take the corpse is closed instead')
-
-    -- re-arm the same corpse and step past the interval
-    host:advance(5100)
-    tb.loot.list = { { pos = { x = start.x, y = start.y, z = 7 }, tries = 0, seq = 2 } }
-    tb.loot.isLootContainer[1] = true
-    tb.sender:clear()
-    tb.loot:process(0, 0)
-    eq(#tb.sender:byKind('use'), 1, 'after 5 s the next bite is allowed')
+    eq(#u, 0, 'the ham is not consumed')
+    eq(#tb.sender:byKind('move'), 0, 'the ham is not moved')
+    eq(#tb.sender:byKind('close'), 1, 'the corpse is closed after the whitelist items are exhausted')
 end
 
 -- ============================================================================

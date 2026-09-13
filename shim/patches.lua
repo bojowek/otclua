@@ -37,6 +37,16 @@ Usage:
 
 local patches = {}
 
+patches.OPTIONAL = {
+  ['/vBot/main.lua'] = {
+    {
+      expected = 'if os.time() > storage.checkVersion + (12 * 60 * 60) then',
+      replacement = 'if false then -- CLI: optional vBot update check disabled',
+      why = 'CLI automation excludes the optional HTTP version check',
+    },
+  },
+}
+
 --- The table.  `expected` must occur EXACTLY ONCE in the upstream file.
 patches.LIST = {
 
@@ -119,18 +129,20 @@ function patches.key(name)
 end
 
 function patches.has(virtualPath)
-    return patches.LIST[virtualPath] ~= nil
+  return patches.LIST[virtualPath] ~= nil or patches.OPTIONAL[virtualPath] ~= nil
 end
 
 --- apply(src, virtualPath, notes) -> src
 --- RAISES when a patch no longer applies (upstream drifted) or matches twice.
 --- `notes` (optional array) collects one human-readable line per applied patch.
 function patches.apply(src, virtualPath, notes)
-    local list = patches.LIST[virtualPath]
+  local list = patches.LIST[virtualPath] or patches.OPTIONAL[virtualPath]
+  local optional = patches.LIST[virtualPath] == nil
     if not list or type(src) ~= 'string' then return src end
     for _, p in ipairs(list) do
         local from, to = src:find(p.expected, 1, true)
         if not from then
+      if optional then break end
             error(('shim/patches: the patch for %s no longer applies -- the expected text is '
                    .. 'absent.  Upstream drifted; re-audit before running. (%s)')
                   :format(virtualPath, p.why), 0)

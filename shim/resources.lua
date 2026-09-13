@@ -274,6 +274,15 @@ end
 local RES = {}
 RES.__index = RES
 
+local function under(path, root)
+    return path == root or root == '/' or path:sub(1, #root + 1) == root .. '/'
+end
+
+local function cleanVirtual(path)
+    path = collapse(path):gsub('/+$', '')
+    return path == '' and '/' or path
+end
+
 -- NOTE ON CALL STYLE: the real g_resources is a C++ singleton bound with
 -- bindSingletonFunction, so every call site in vBot and in game_bot uses a DOT --
 -- `g_resources.fileExists(path)`, never `g_resources:fileExists(path)`.  `new`
@@ -298,7 +307,12 @@ function RES:resolvePath(path)
     else
         full = '/' .. self:getCurrentSourcePath() .. '/' .. path
     end
-    return collapse(full)
+    full = collapse(full)
+    local parts = {}
+    for part in full:gmatch('[^/]+') do
+        if part ~= '.' then parts[#parts + 1] = part end
+    end
+    return '/' .. table.concat(parts, '/')
 end
 
 --- Sandbox check.  Returns hostPath, or nil + reason.
@@ -315,32 +329,81 @@ function RES:_hostPath(virtualPath)
     return self._writeDir .. p:sub(2)
 end
 
+function RES:_overlay(virtualPath)
+    for _, overlay in ipairs(self._overlays) do
+        if under(virtualPath, overlay) then return overlay end
+    end
+    return nil
+end
+
+function RES:_mount(virtualPath)
+    for _, mount in ipairs(self._mounts) do
+        if under(virtualPath, mount.path) then return mount end
+    end
+    return nil
+end
+
+function RES:_mountedPath(mount, virtualPath)
+    return mount.dir .. virtualPath:sub(#mount.path + 1)
+end
+
 --- Resolve + sandbox in one step.  `mode` is 'read' | 'write' | 'predicate'.
 function RES:_real(path, mode)
     local v = self:resolvePath(path)
     local host_, why = self:_hostPath(v)
-    if host_ then return host_, v end
-    self._refusals[v] = why
-    local msg = ('g_resources: refusing %q -- %s (sandbox root %s)')
-                :format(tostring(path), why, self._writeDir)
-    if mode == 'predicate' and not self._strict then
-        logline('error', '%s', msg)
-        return nil, v
+    if not host_ then
+        self._refusals[v] = why
+        local msg = ('g_resources: refusing %q -- %s (sandbox root %s)')
+                    :format(tostring(path), why, self._writeDir)
+        if mode == 'predicate' and not self._strict then
+            logline('error', '%s', msg)
+            return nil, v
+        end
+        error(msg, 3)
     end
-    error(msg, 3)
+
+    local mount = self:_mount(v)
+    local overlay = self:_overlay(v)
+    if overlay and mount then
+        if mode == 'write' or host.isFile(host_) or host.isDir(host_) then
+            return host_, v
+        end
+        return self:_mountedPath(mount, v), v
+    end
+    if mode == 'write' then
+        for _, candidate in ipairs(self._mounts) do
+            if under(candidate.path, v) then
+                self._refusals[v] = 'read-only mount ' .. candidate.path
+                return nil, v
+            end
+        end
+    end
+    if mount then
+        if mode == 'write' then
+            self._refusals[v] = 'read-only mount ' .. mount.path
+            return nil, v
+        end
+        return self:_mountedPath(mount, v), v
+    end
+    return host_, v
 end
 
 -- --------------------------------------------------------------- predicates --
 
 function RES:fileExists(path)
-    local real = self:_real(path, 'predicate')
+    local real, v = self:_real(path, 'predicate')
     if not real then return false end
+    local mount = self:_mount(v)
+    if mount and host.isDir(mount.dir) and v == mount.path then return false end
     return host.isFile(real)
 end
 
 function RES:directoryExists(path)
-    local real = self:_real(path, 'predicate')
+    local real, v = self:_real(path, 'predicate')
     if not real then return false end
+    for _, mount in ipairs(self._mounts) do
+        if under(mount.path, v) and host.isDir(mount.dir) then return true end
+    end
     return host.isDir(real)
 end
 
@@ -363,6 +426,34 @@ function RES:listDirectoryFiles(dir, fullPath, raw, recursive)
     end
 
     local names = host.list(real)
+    if not raw and self:_overlay(path) then
+        local mount = self:_mount(path)
+        if mount then
+            local fallback = host.list(self:_mountedPath(mount, path))
+            local seen = {}
+            for i = 1, #names do seen[names[i]] = true end
+            for i = 1, #fallback do
+                if not seen[fallback[i]] then
+                    names[#names + 1] = fallback[i]
+                    seen[fallback[i]] = true
+                end
+            end
+        end
+    end
+    local seen = {}
+    for i = 1, #names do seen[names[i]] = true end
+    if not raw then
+        for _, mount in ipairs(self._mounts) do
+            if mount.path ~= path and under(mount.path, path) and host.isDir(mount.dir) then
+                local suffix = mount.path:sub(path == '/' and 2 or #path + 2)
+                local name = suffix:match('^[^/]+')
+                if name and not seen[name] then
+                    names[#names + 1] = name
+                    seen[name] = true
+                end
+            end
+        end
+    end
     for i = 1, #names do
         local fileOrDir = names[i]
         if fullPath then
@@ -388,7 +479,12 @@ end
 
 --- readFileContents(path) -> string.  RAISES when the file is missing (I6/B11).
 function RES:readFileContents(path)
-    local real = self:_real(path, 'read')
+    local real, v = self:_real(path, 'read')
+    for _, mount in ipairs(self._mounts) do
+        if under(mount.path, v) and host.isDir(mount.dir) and v == mount.path then
+            error(("unable to read file '%s': is a mounted directory"):format(v), 2)
+        end
+    end
     local f = io.open(real, 'rb')
     if not f then
         error(("unable to open file '%s': not found"):format(self:resolvePath(path)), 2)
@@ -415,6 +511,7 @@ end
 
 function RES:makeDir(path)
     local real = self:_real(path, 'write')
+    if not real then return false end
     return mkdirRecursive(real)
 end
 
@@ -423,6 +520,7 @@ end
 function RES:writeFileContents(path, data)
     if type(data) ~= 'string' then data = tostring(data) end
     local real = self:_real(path, 'write')
+    if not real then return false end
     local parent = real:match('^(.*)/[^/]+$')
     if parent and not host.isDir(parent) then mkdirRecursive(parent) end
     local f, err = io.open(real, 'wb')
@@ -452,6 +550,7 @@ end
 
 function RES:deleteFile(path)
     local real = self:_real(path, 'write')
+    if not real then return false end
     if not (host.isFile(real) or host.isDir(real)) then return false end
     return deleteTree(real)
 end
@@ -520,7 +619,45 @@ function resources.new(writeDir, opts)
         _strict     = opts.strict and true or false,
         _sourcePath = opts.sourcePath,          -- nil => walk the stack
         _refusals   = {},                       -- virtual path -> refusal reason
+        _mounts     = {},
+        _overlays   = {},
     }, RES)
+
+    for virtual, dir in pairs(opts.mounts or {}) do
+        local path = cleanVirtual(tostring(virtual):gsub('\\', '/'))
+        dir = tostring(dir):gsub('\\', '/'):gsub('/+$', '')
+        local invalid = path == '/' or path:sub(1, 1) ~= '/' or path:find('\\', 1, true)
+        for part in path:gmatch('[^/]+') do
+            if part == '..' then invalid = true end
+        end
+        if invalid then
+            error('resources.new: invalid mount path ' .. tostring(virtual), 2)
+        end
+        if dir == '' then error('resources.new: mount directory is empty', 2) end
+        impl._mounts[#impl._mounts + 1] = { path = path, dir = dir }
+    end
+    table.sort(impl._mounts, function(a, b) return #a.path > #b.path end)
+
+    for _, virtual in ipairs(opts.overlays or {}) do
+        local path = cleanVirtual(tostring(virtual):gsub('\\', '/'))
+        if path:sub(1, 1) ~= '/' then
+            error('resources.new: invalid overlay path ' .. tostring(virtual), 2)
+        end
+        for part in path:gmatch('[^/]+') do
+            if part == '..' then
+                error('resources.new: invalid overlay path ' .. tostring(virtual), 2)
+            end
+        end
+        local inside = false
+        for _, mount in ipairs(impl._mounts) do
+            if path ~= mount.path and under(path, mount.path) then inside = true end
+        end
+        if not inside then
+            error('resources.new: overlay must be inside a mount: ' .. tostring(virtual), 2)
+        end
+        impl._overlays[#impl._overlays + 1] = path
+    end
+    table.sort(impl._overlays, function(a, b) return #a > #b end)
 
     local g = { _impl = impl }
     local names = {
